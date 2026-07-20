@@ -1,0 +1,24 @@
+# Hub
+.env
+.venv/
+__pycache__/
+*.pyc
+.sisyphus/
+*.log
+.DS_Store
+Thumbs.db
+
+# Bundled farms (runtime secrets & outputs)
+farms/*/.env
+farms/*/.env.*
+farms/*/.venv/
+farms/*/results/
+farms/*/screenshots/
+farms/*/logs/
+farms/*/proxies.txt
+farms/*/__pycache__/
+farms/**/*.log
+
+# Local backups / noise
+**/.env.local-backup
+**/tmp_*
