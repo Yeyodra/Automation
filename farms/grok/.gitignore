@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+results/
+screenshots/
+*.log
+.DS_Store
+# real proxy lists often contain credentials
+proxies.txt
