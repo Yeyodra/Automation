@@ -54,11 +54,13 @@ def run_job(
     warp_tries: int | None = None,
     dry_run: bool = False,
     log: Callable[[str], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> RunResult:
     """
     Launch one process: <hub-venv-python> farm.py [args...]
 
     warp_every_n: inject into env; farm rotates after every N OK accounts.
+    env_overrides: force env keys for this run (e.g. GROK_EMAIL_MODE from HUD).
     Cooperative stop via core.jobctl.request_stop / stop_all.
     """
     use_print = log is None
@@ -76,6 +78,12 @@ def run_job(
     farm_args = list(args)
     env = build_job_env(job.env_prefix, job.cwd)
     prefix = job.env_prefix or ""
+
+    # HUD / caller overrides win over .env mapping
+    if env_overrides:
+        for k, v in env_overrides.items():
+            if k and v is not None and str(v).strip() != "":
+                env[str(k)] = str(v)
 
     total_n = extract_count(farm_args, default=1)
     conc = extract_concurrent(farm_args, default=1)

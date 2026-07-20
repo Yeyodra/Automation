@@ -63,7 +63,7 @@ class HubApp(App[None]):
     }
     #form {
         height: auto;
-        max-height: 8;
+        max-height: 12;
         border: solid $accent;
         padding: 0 1;
         margin: 0 0 1 0;
@@ -72,6 +72,9 @@ class HubApp(App[None]):
     #form Label { width: auto; color: $text-muted; padding: 0 1 0 0; }
     #form Input { width: 1fr; }
     #form Checkbox { width: auto; margin-right: 2; }
+    #email-row { height: 3; }
+    #email-row.hidden { display: none; }
+    #email-row Button { min-width: 12; margin-right: 1; }
     #progress {
         height: auto;
         min-height: 3;
@@ -119,6 +122,8 @@ class HubApp(App[None]):
         super().__init__()
         self._progress = BatchProgress()
         self._syncing_form = False  # prevent Input.Changed feedback loop
+        # grok-only: domain/plus_trick (IMAP) vs gptmail (API)
+        self._grok_email_mode: str = "domain"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -141,6 +146,12 @@ class HubApp(App[None]):
                         placeholder="0=off else =c",
                     )
                     yield Checkbox("Dry-run", id="chk-dry", value=False)
+                # grok-only email provider (shown when Job=grok)
+                with Horizontal(id="email-row", classes="row"):
+                    yield Label("Email")
+                    yield Button("IMAP", id="btn-email-imap", variant="success")
+                    yield Button("GPTMail", id="btn-email-gptmail", variant="default")
+                    yield Label("  (grok only)", id="email-hint")
             yield ProgressPanel("Progress: idle — set -n then Run", id="progress")
             with Horizontal(id="actions"):
                 yield Button("Run [R]", id="btn-run", variant="success")
@@ -164,9 +175,61 @@ class HubApp(App[None]):
         self._log(f"Hub ready. Jobs: {jobs}")
         self._log("everyN LIVE sync: ubah -c → everyN ikut (kalau everyN≠0). 0=off.")
         self._log("Stop [S]=kill farm · Status/Rotate=manual WARP · Quit=close HUD")
+        self._log("Grok Email: klik IMAP (catch-all) atau GPTMail (temp API) — hanya job grok.")
         self._sync_every_n_ui(silent=True)
+        self._sync_email_row()
         self._paint_progress()
         self._warp_worker("status", quiet=True)
+
+    def _job_id(self) -> str:
+        try:
+            return (self.query_one("#job", Input).value.strip() or "grok").lower()
+        except Exception:
+            return "grok"
+
+    def _sync_email_row(self) -> None:
+        """Show IMAP/GPTMail toggles only when Job=grok."""
+        try:
+            row = self.query_one("#email-row", Horizontal)
+        except Exception:
+            return
+        is_grok = self._job_id() == "grok"
+        row.set_class(not is_grok, "hidden")
+        if is_grok:
+            self._paint_email_buttons()
+
+    def _paint_email_buttons(self) -> None:
+        mode = self._grok_email_mode if self._grok_email_mode in ("domain", "gptmail") else "domain"
+        self._grok_email_mode = mode
+        try:
+            btn_imap = self.query_one("#btn-email-imap", Button)
+            btn_gpt = self.query_one("#btn-email-gptmail", Button)
+            btn_imap.variant = "success" if mode == "domain" else "default"
+            btn_gpt.variant = "success" if mode == "gptmail" else "default"
+        except Exception:
+            pass
+
+    @on(Input.Changed, "#job")
+    def on_job_changed(self, _event: Input.Changed) -> None:
+        self._sync_email_row()
+
+    @on(Button.Pressed, "#btn-email-imap")
+    def on_email_imap(self) -> None:
+        if self._job_id() != "grok":
+            return
+        self._grok_email_mode = "domain"
+        self._paint_email_buttons()
+        self._status("Grok email: IMAP (domain catch-all)")
+        self._log("[hub] grok email mode → domain (IMAP)")
+
+    @on(Button.Pressed, "#btn-email-gptmail")
+    def on_email_gptmail(self) -> None:
+        if self._job_id() != "grok":
+            return
+        self._grok_email_mode = "gptmail"
+        self._paint_email_buttons()
+        self._status("Grok email: GPTMail (API, no IMAP)")
+        self._log("[hub] grok email mode → gptmail")
 
     def _parse_int_field(self, field_id: str, default: int = 1) -> int:
         try:
@@ -385,12 +448,20 @@ class HubApp(App[None]):
             + (f" everyN={every_n}" if every_n else " everyN=off")
             + (" dry" if dry else "")
         )
+        env_overrides: dict[str, str] | None = None
+        if job.lower() == "grok":
+            mode = self._grok_email_mode if self._grok_email_mode in ("domain", "gptmail") else "domain"
+            env_overrides = {
+                "GROK_EMAIL_MODE": mode,
+                "EMAIL_MODE": mode,
+            }
+            self._log(f"[hub] grok EMAIL_MODE={mode} (HUD click)")
         self._log(
             f"-- run {job}  {' '.join(args)}  c={c} everyN={every_n or 'off'} dry={dry}"
         )
         self._log_widget().focus()
         self._log_widget().auto_scroll = True
-        self._run_job_worker(job, args, dry, every_n)
+        self._run_job_worker(job, args, dry, every_n, env_overrides)
 
     def action_stop_job(self) -> None:
         """Global stop: kill farm process tree (Camoufox children)."""
@@ -417,6 +488,7 @@ class HubApp(App[None]):
         args: list[str],
         dry: bool,
         every_n: int = 0,
+        env_overrides: dict[str, str] | None = None,
     ) -> None:
         try:
             result = run_job(
@@ -427,6 +499,7 @@ class HubApp(App[None]):
                 warp_every_n=every_n,
                 dry_run=dry,
                 log=self._thread_log,
+                env_overrides=env_overrides,
             )
             if result.stopped:
                 self._thread_status(f"STOPPED ({result.duration_s:.0f}s)")
