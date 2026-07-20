@@ -36,9 +36,12 @@ Isi shared keys **tanpa prefix** supaya bisa dipakai banyak farm:
 |------------|--------|----------------|
 | `IMAP_USER` / `IMAP_PASS` | Gmail app password | OTP semua farm |
 | `IMAP_HOST` / `IMAP_PORT` | `imap.gmail.com` / `993` | IMAP |
-| `EMAIL_MODE` | `domain` \| `plus_trick` | Mode email |
-| `EMAIL_DOMAIN` | catch-all tanpa `@` | domain mode |
-| `GMAIL_BASE` | base plus-trick | plus_trick |
+| `EMAIL_MODE` | `domain` \| `plus_trick` \| `gptmail` | Mode email |
+| `EMAIL_DOMAIN` | catch-all tanpa `@` | domain mode (IMAP) |
+| `GMAIL_BASE` | base plus-trick | plus_trick (IMAP) |
+| `GPTMAIL_API` | `https://mail.chatgpt.org.uk` | gptmail mode (no IMAP) |
+| `GPTMAIL_DOMAIN` | (empty=auto) | pin domain; empty = pool + block/rotate |
+| `GPTMAIL_PREFIX` | optional | local-part prefix |
 | `ACCOUNT_PASSWORD` | password akun farm | signup |
 | `HEADLESS` | `true` / `false` | browser |
 | `MAX_ACCOUNTS` / `CONCURRENT` / `SPAWN_DELAY` | run defaults | batch |
@@ -51,6 +54,7 @@ Override per-job (opsional, di **hub** `.env` juga):
 ```env
 GROK_PASSWORD=...          # hanya grok, menang atas ACCOUNT_PASSWORD
 GROK_EMAIL_DOMAIN=...
+GROK_EMAIL_MODE=gptmail    # optional; IMAP not required when gptmail
 ENTER_GIFT_CODE=...        # nanti saat enter di-bundle
 ENTER_EMAIL_MODE=gptmail
 ```
