@@ -3,9 +3,9 @@
 Standalone Grok / xAI account farmer (CLI-only).
 
 Flow per account:
-  1. Generate email (catch-all domain OR Gmail plus-trick)
+  1. Generate email (catch-all / plus_trick IMAP, OR gptmail API)
   2. Camoufox browser → accounts.x.ai/sign-up
-  3. Email → OTP (IMAP) → Confirm
+  3. Email → OTP (IMAP or GPTMail API) → Confirm
   4. Name + password + Turnstile → Complete sign up
   5. Login if needed → OAuth PKCE (Grok CLI) → tokens
   6. Append result to JSON + TXT (no poolprox DB)
@@ -74,9 +74,14 @@ IMAP_HOST = _env("GROK_IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(_env("GROK_IMAP_PORT", "993") or "993")
 EMAIL_DOMAIN = _env("GROK_EMAIL_DOMAIN").lstrip("@")
 EMAIL_MODE = _env("GROK_EMAIL_MODE", "domain").lower()
-if EMAIL_MODE not in ("plus_trick", "domain"):
+# domain | plus_trick | gptmail (mail.chatgpt.org.uk — no IMAP)
+if EMAIL_MODE not in ("plus_trick", "domain", "gptmail"):
     EMAIL_MODE = "domain"
 GMAIL_BASE = _env("GROK_GMAIL_BASE").lower() or IMAP_USER.lower()
+# GPTMail (optional temp-mail provider; OTP via API)
+GPTMAIL_API = _env("GROK_GPTMAIL_API", "https://mail.chatgpt.org.uk").rstrip("/")
+GPTMAIL_DOMAIN = _env("GROK_GPTMAIL_DOMAIN").lstrip("@").lower()  # optional pin
+GPTMAIL_PREFIX = _env("GROK_GPTMAIL_PREFIX").lower()  # optional local prefix
 ACCOUNT_PASSWORD = _env("GROK_PASSWORD", "$Priyo000")
 MAX_ACCOUNTS = int(_env("GROK_MAX_ACCOUNTS", "5") or "5")
 CONCURRENT = int(_env("GROK_CONCURRENT", "1") or "1")
@@ -132,6 +137,10 @@ def _effective_warp_every_n() -> int:
 # Results root: each run creates results/batch_<id>/ (unless legacy single-file paths set)
 RESULTS_ROOT = Path(_env("GROK_RESULTS_DIR", str(_ROOT / "results")))
 USED_EMAILS_FILE = Path(_env("GROK_USED_EMAILS_FILE", str(RESULTS_ROOT / "used_emails.txt")))
+# Domains rejected by xAI (gptmail) — permanent across runs
+BLOCKED_DOMAINS_FILE = Path(
+    _env("GROK_BLOCKED_DOMAINS_FILE", str(RESULTS_ROOT / "gptmail_blocked_domains.txt"))
+)
 # Optional legacy override: if any of these set, write to those fixed paths (no per-batch folder)
 _LEGACY_JSON = _env("GROK_RESULTS_JSON")
 _LEGACY_TXT = _env("GROK_RESULTS_TXT")
@@ -635,6 +644,15 @@ def vlog(msg: str, attempt: int | None = None) -> None:
 # ── Email uniqueness (crypto random + global used list across all batches) ───
 _used_emails: set[str] = set()
 _emails_lock = asyncio.Lock()
+
+# ── GPTMail (mail.chatgpt.org.uk) — optional EMAIL_MODE=gptmail ─────────────
+_gptmail_accounts: dict[str, dict[str, str]] = {}
+_gptmail_lock = threading.Lock()
+_gptmail_domains_cache: list[str] = []
+_gptmail_domains_ts = 0.0
+_gptmail_slot_domain: dict[int, str] = {}
+_gptmail_domain_rr = 0
+_gptmail_blocked_domains: set[str] = set()
 _ALPHANUM = string.ascii_lowercase + string.digits
 
 
@@ -736,7 +754,7 @@ def init_batch(max_accounts: int, concurrent: int) -> str:
         "batch_id": BATCH_ID,
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "email_mode": EMAIL_MODE,
-        "email_domain": EMAIL_DOMAIN if EMAIL_MODE == "domain" else None,
+        "email_domain": (EMAIL_DOMAIN if EMAIL_MODE == "domain" else (GPTMAIL_DOMAIN or "auto") if EMAIL_MODE == "gptmail" else None),
         "max_accounts": max_accounts,
         "concurrent": concurrent,
         "email_local_len": EMAIL_LOCAL_LEN,
@@ -747,10 +765,24 @@ def init_batch(max_accounts: int, concurrent: int) -> str:
     return BATCH_ID
 
 
-async def generate_email() -> str:
-    """Crypto-random unique email; reserved in global set + used_emails.txt."""
+async def generate_email(worker_slot: int | None = None) -> str:
+    """Unique email; domain/plus_trick local, gptmail via API claim.
+
+    worker_slot: concurrent slot for gptmail sticky domain only.
+    """
     async with _emails_lock:
         for _ in range(200):
+            if EMAIL_MODE == "gptmail":
+                loop = asyncio.get_event_loop()
+                addr = await loop.run_in_executor(
+                    None, lambda: create_gptmail_inbox(worker_slot)
+                )
+                key = addr.lower()
+                if key not in _used_emails:
+                    _used_emails.add(key)
+                    _persist_used_email(key)
+                    return addr
+                continue
             if EMAIL_MODE == "domain":
                 if not EMAIL_DOMAIN:
                     raise RuntimeError("GROK_EMAIL_DOMAIN required for domain mode")
@@ -772,6 +804,7 @@ async def generate_email() -> str:
                 _persist_used_email(key)  # reserve immediately so other processes / future batches skip
                 return addr
     raise RuntimeError("Could not generate unique email after 200 attempts")
+
 
 
 def random_name() -> tuple[str, str]:
@@ -2019,18 +2052,497 @@ async def fill_xai_otp_boxes(page, otp_chars: str, attempt: int) -> bool:
     return False
 
 
+
+# ── GPTMail helpers (EMAIL_MODE=gptmail) ─────────────────────────────────────
+
+def _http_json(url: str, data: dict | None = None, headers: dict | None = None, method: str | None = None) -> dict | list:
+    """Minimal JSON HTTP helper (stdlib)."""
+    h = {
+        "Accept": "application/json",
+        "User-Agent": "grok-farm/gptmail",
+    }
+    if headers:
+        h.update(headers)
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        h["Content-Type"] = "application/json"
+        method = method or "POST"
+    req = urllib.request.Request(url, data=body, headers=h, method=method or "GET")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+        return json.loads(raw) if raw else {}
+
+
+def _strip_html(html: str) -> str:
+    s = html or ""
+    s = re.sub(r"<style[\s\S]*?</style>", " ", s, flags=re.I)
+    s = re.sub(r"<script[\s\S]*?</script>", " ", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _gptmail_headers(token: str = "") -> dict[str, str]:
+    h = {
+        "Accept": "application/json",
+        "User-Agent": "grok-farm/gptmail",
+        "Origin": GPTMAIL_API,
+        "Referer": f"{GPTMAIL_API}/",
+    }
+    if token:
+        h["x-inbox-token"] = token
+        try:
+            payload_b64 = token.split(".")[0]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+            sid = payload.get("sid") or ""
+            if sid:
+                h["Cookie"] = f"gm_sid={sid}"
+        except Exception:
+            pass
+    return h
+
+
+def _gptmail_load_domains(force: bool = False) -> list[str]:
+    """GET /api/domains/public — cache ~10 min."""
+    global _gptmail_domains_cache, _gptmail_domains_ts
+    now = time.time()
+    if not force and _gptmail_domains_cache and (now - _gptmail_domains_ts) < 600:
+        return list(_gptmail_domains_cache)
+    data = _http_json(f"{GPTMAIL_API}/api/domains/public", headers=_gptmail_headers())
+    if not isinstance(data, dict) or not data.get("success", True):
+        raise RuntimeError(f"gptmail domains failed: {str(data)[:200]}")
+    raw = (data.get("data") or {}).get("domains") or []
+    out: list[str] = []
+    for d in raw:
+        if not isinstance(d, dict):
+            continue
+        name = (d.get("domain_name") or d.get("domain") or "").strip().lower()
+        if not name or "@" in name:
+            continue
+        if d.get("is_active") not in (None, 1, True, "1"):
+            continue
+        vis = (d.get("visibility") or "public").lower()
+        if vis and vis != "public":
+            continue
+        out.append(name)
+    if not out:
+        raise RuntimeError(f"gptmail: empty domain list {str(data)[:200]}")
+    _gptmail_domains_cache = out
+    _gptmail_domains_ts = now
+    print(f"[GPTMAIL] domains loaded: {len(out)}", flush=True)
+    return list(out)
+
+
+def _load_blocked_domains() -> None:
+    """Load permanent xAI-rejected domains from disk into memory."""
+    global _gptmail_blocked_domains
+    if not BLOCKED_DOMAINS_FILE.is_file():
+        return
+    try:
+        loaded: set[str] = set()
+        for line in BLOCKED_DOMAINS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # allow "domain # reason" comments
+            dom = line.split("#", 1)[0].strip().lower().lstrip("@")
+            if dom and "." in dom and "@" not in dom:
+                loaded.add(dom)
+        if loaded:
+            with _gptmail_lock:
+                _gptmail_blocked_domains |= loaded
+            print(f"[GPTMAIL] loaded {len(loaded)} blocked domain(s) from {BLOCKED_DOMAINS_FILE.name}", flush=True)
+    except Exception as e:
+        print(f"[GPTMAIL] could not read blocked list: {e}", flush=True)
+
+
+def _persist_blocked_domain(domain: str, reason: str = "") -> None:
+    """Append domain to permanent blocklist (never re-enter pool)."""
+    dom = (domain or "").strip().lower().lstrip("@")
+    if not dom:
+        return
+    try:
+        BLOCKED_DOMAINS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # skip if already on disk
+        if BLOCKED_DOMAINS_FILE.is_file():
+            existing = BLOCKED_DOMAINS_FILE.read_text(encoding="utf-8", errors="replace").lower()
+            if re.search(rf"(?m)^\s*{re.escape(dom)}(\s|#|$)", existing):
+                return
+        note = (reason or "").replace("\n", " ").strip()[:120]
+        with open(BLOCKED_DOMAINS_FILE, "a", encoding="utf-8") as f:
+            if note:
+                f.write(f"{dom}  # {note}\n")
+            else:
+                f.write(f"{dom}\n")
+    except Exception as e:
+        print(f"[GPTMAIL] persist block fail {dom}: {e}", flush=True)
+
+
+def _gptmail_pool() -> list[str]:
+    """Usable public domains (excludes permanently blocked). Never recycle blocked."""
+    domains = _gptmail_load_domains()
+    pool = [d for d in domains if 4 <= len(d) <= 40 and "." in d]
+    if not pool:
+        pool = list(domains)
+    with _gptmail_lock:
+        blocked = set(_gptmail_blocked_domains)
+    free = [d for d in pool if d not in blocked]
+    if free:
+        return free
+    # do NOT recycle blocked — xAI already rejected them
+    raise RuntimeError(
+        f"gptmail: no usable domains left "
+        f"(pool={len(pool)} blocked={len(blocked)} file={BLOCKED_DOMAINS_FILE.name})"
+    )
+
+
+def _gptmail_pick_domain(worker_slot: int | None = None) -> str:
+    """Sticky domain per worker slot; only changes when domain is blocked."""
+    if GPTMAIL_DOMAIN:
+        # pinned domain still checked against blocklist
+        if GPTMAIL_DOMAIN in _gptmail_blocked_domains:
+            raise RuntimeError(
+                f"gptmail: pinned domain {GPTMAIL_DOMAIN} is blocked by xAI — "
+                f"clear GROK_GPTMAIL_DOMAIN or remove from {BLOCKED_DOMAINS_FILE.name}"
+            )
+        return GPTMAIL_DOMAIN
+    pool = _gptmail_pool()
+    if worker_slot is None:
+        return secrets.choice(pool)
+    with _gptmail_lock:
+        global _gptmail_domain_rr
+        cur = _gptmail_slot_domain.get(worker_slot)
+        if cur and cur not in _gptmail_blocked_domains and cur in pool:
+            return cur
+        used = {d for s, d in _gptmail_slot_domain.items() if s != worker_slot}
+        candidates = [d for d in pool if d not in used] or list(pool)
+        idx = _gptmail_domain_rr % len(candidates)
+        _gptmail_domain_rr += 1
+        chosen = candidates[idx]
+        _gptmail_slot_domain[worker_slot] = chosen
+        print(
+            f"[GPTMAIL] slot={worker_slot} sticky domain={chosen} "
+            f"(blocked={len(_gptmail_blocked_domains)})",
+            flush=True,
+        )
+        return chosen
+
+
+def gptmail_block_domain(domain: str, reason: str = "", worker_slot: int | None = None) -> None:
+    """Mark domain blocked permanently (memory + disk); next claim rotates sticky slot."""
+    dom = (domain or "").strip().lower().lstrip("@")
+    if not dom:
+        return
+    with _gptmail_lock:
+        already = dom in _gptmail_blocked_domains
+        _gptmail_blocked_domains.add(dom)
+        if worker_slot is not None and _gptmail_slot_domain.get(worker_slot) == dom:
+            _gptmail_slot_domain.pop(worker_slot, None)
+        else:
+            for s, d in list(_gptmail_slot_domain.items()):
+                if d == dom:
+                    _gptmail_slot_domain.pop(s, None)
+    if not already:
+        _persist_blocked_domain(dom, reason)
+    print(
+        f"[GPTMAIL] BLOCK domain={dom} reason={reason[:80]!r} "
+        f"total_blocked={len(_gptmail_blocked_domains)} "
+        f"(persisted → {BLOCKED_DOMAINS_FILE.name})",
+        flush=True,
+    )
+
+
+def _gptmail_make_local() -> str:
+    if GPTMAIL_PREFIX:
+        suffix = _crypto_local_part(max(4, min(10, EMAIL_LOCAL_LEN // 2)))
+        base = re.sub(r"[^a-z0-9._-]", "", GPTMAIL_PREFIX)[:24] or "grk"
+        return f"{base}{suffix}"
+    letters = "".join(secrets.choice(string.ascii_lowercase) for _ in range(secrets.randbelow(5) + 6))
+    digits = "".join(secrets.choice(string.digits) for _ in range(secrets.randbelow(3) + 2))
+    return f"{letters}{digits}"
+
+
+def create_gptmail_inbox(worker_slot: int | None = None) -> str:
+    """Claim GPTMail inbox on sticky domain for worker_slot."""
+    last_err = ""
+    for attempt in range(12):
+        domain = _gptmail_pick_domain(worker_slot)
+        local = _gptmail_make_local()
+        addr = f"{local}@{domain}".lower()
+        try:
+            data = _http_json(
+                f"{GPTMAIL_API}/api/inbox-token",
+                {"email": addr},
+                headers=_gptmail_headers(),
+            )
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            last_err = f"HTTP {e.code}: {body[:160]}"
+            if e.code in (409, 422, 429, 400):
+                time.sleep(0.3 + attempt * 0.1)
+                continue
+            raise RuntimeError(f"gptmail inbox-token {last_err}") from e
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.4)
+            continue
+        if not isinstance(data, dict) or not data.get("success", True):
+            last_err = str(data)[:200]
+            time.sleep(0.3)
+            continue
+        auth = data.get("auth") or {}
+        token = auth.get("token") or ""
+        email = (auth.get("email") or (data.get("data") or {}).get("email") or addr).lower()
+        if not token:
+            last_err = f"no token in {data}"
+            continue
+        with _gptmail_lock:
+            _gptmail_accounts[email] = {
+                "token": token,
+                "expires_at": str(auth.get("expires_at") or ""),
+                "worker_slot": str(worker_slot if worker_slot is not None else ""),
+            }
+        print(
+            f"[GPTMAIL] claimed {email} slot={worker_slot if worker_slot is not None else '-'}",
+            flush=True,
+        )
+        return email
+    raise RuntimeError(f"gptmail: could not claim inbox after retries ({last_err})")
+
+
+def read_otp_from_gptmail_sync(target_email: str, timeout: int = 180, since_ts: float | None = None) -> str | None:
+    """Poll GPTMail for xAI XXX-XXX confirmation code."""
+    addr = target_email.lower()
+    with _gptmail_lock:
+        cred = dict(_gptmail_accounts.get(addr) or {})
+    token = cred.get("token") or ""
+    if not token:
+        print(f"[GPTMAIL] no session for {addr}", flush=True)
+        return None
+    print(f"[GPTMAIL] Waiting OTP -> {addr} (timeout={timeout}s)...", flush=True)
+    start = time.time()
+    since_ts = since_ts or (start - 30)
+    seen_ids: set[str] = set()
+    polls = 0
+    while time.time() - start < timeout:
+        polls += 1
+        elapsed = int(time.time() - start)
+        try:
+            q = urlencode({"email": addr})
+            data = _http_json(
+                f"{GPTMAIL_API}/api/emails?{q}",
+                headers=_gptmail_headers(token),
+            )
+            if isinstance(data, dict) and data.get("success") is False:
+                err = data.get("error") or data
+                print(f"[GPTMAIL] list error: {err}", flush=True)
+                if "denied" in str(err).lower() or "token" in str(err).lower():
+                    try:
+                        recl = _http_json(
+                            f"{GPTMAIL_API}/api/inbox-token",
+                            {"email": addr},
+                            headers=_gptmail_headers(),
+                        )
+                        auth = (recl or {}).get("auth") or {}
+                        if auth.get("token"):
+                            token = auth["token"]
+                            with _gptmail_lock:
+                                _gptmail_accounts[addr] = {
+                                    "token": token,
+                                    "expires_at": str(auth.get("expires_at") or ""),
+                                }
+                            print(f"[GPTMAIL] re-claimed token for {addr}", flush=True)
+                    except Exception as e2:
+                        print(f"[GPTMAIL] re-claim fail: {e2}", flush=True)
+                time.sleep(2.5)
+                continue
+            items = []
+            if isinstance(data, dict):
+                items = (data.get("data") or {}).get("emails") or data.get("emails") or []
+            elif isinstance(data, list):
+                items = data
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("id") or "")
+                if mid and mid in seen_ids:
+                    continue
+                if mid:
+                    seen_ids.add(mid)
+                ts = item.get("timestamp") or 0
+                try:
+                    ts_f = float(ts)
+                    if ts_f > 1e12:
+                        ts_f /= 1000.0
+                    if ts_f and ts_f < since_ts - 5:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                subject = str(item.get("subject") or "")
+                content = str(item.get("content") or item.get("text") or "")
+                html = str(item.get("html_content") or item.get("html") or "")
+                body = content + "\n" + _strip_html(html)
+                fr = str(item.get("from_address") or item.get("from") or "")
+                code = _extract_xai_code(subject, body)
+                if not code and mid:
+                    try:
+                        q2 = urlencode({"email": addr, "include_raw": "0"})
+                        full = _http_json(
+                            f"{GPTMAIL_API}/api/email/{mid}?{q2}",
+                            headers=_gptmail_headers(token),
+                        )
+                        d = (full or {}).get("data") if isinstance(full, dict) else None
+                        if not isinstance(d, dict) and isinstance(full, dict):
+                            d = full
+                        if isinstance(d, dict):
+                            subject = str(d.get("subject") or subject)
+                            content = str(d.get("content") or d.get("text") or content)
+                            html = str(d.get("html_content") or d.get("html") or html)
+                            body = content + "\n" + _strip_html(html)
+                            fr = str(d.get("from_address") or d.get("from") or fr)
+                            code = _extract_xai_code(subject, body)
+                    except Exception as e_det:
+                        if polls % 4 == 0:
+                            print(f"[GPTMAIL] detail fail: {e_det}", flush=True)
+                if not code:
+                    continue
+                blob = f"{subject} {fr} {body}".lower()
+                if "xai" not in blob and "grok" not in blob and "confirmation" not in blob:
+                    if "code" not in blob and "verify" not in blob:
+                        continue
+                with _claimed_otps_lock:
+                    if code in _claimed_otps_sync:
+                        continue
+                    _claimed_otps_sync.add(code)
+                print(
+                    f"[GPTMAIL] OTP found: {code} for {addr} "
+                    f"(subj={subject[:60]!r} from={fr[:40]!r} t+{elapsed}s)",
+                    flush=True,
+                )
+                return code
+            if polls == 1 or polls % 5 == 0:
+                print(
+                    f"[GPTMAIL] still waiting… {elapsed}s/{timeout}s msgs={len(items)}",
+                    flush=True,
+                )
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            print(f"[GPTMAIL] HTTP {e.code}: {body[:120]}", flush=True)
+        except Exception as e:
+            print(f"[GPTMAIL] poll error: {e}", flush=True)
+        time.sleep(3)
+    print(f"[GPTMAIL] Timeout after {timeout}s for {addr}", flush=True)
+    return None
+
+
+async def _page_error_text(page) -> str:
+    """Best-effort page text including red/error nodes (xAI React banners)."""
+    try:
+        return (
+            await page.evaluate(
+                """() => {
+                  const parts = [];
+                  if (document.body) parts.push(document.body.innerText || '');
+                  // role=alert / aria-live often hold validation errors
+                  for (const sel of [
+                    '[role="alert"]',
+                    '[aria-live]',
+                    '[class*="error" i]',
+                    '[class*="Error"]',
+                    '[data-testid*="error" i]',
+                    'p',
+                    'span',
+                  ]) {
+                    try {
+                      for (const el of document.querySelectorAll(sel)) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t && t.length < 500) parts.push(t);
+                      }
+                    } catch (e) {}
+                  }
+                  return parts.join('\\n');
+                }"""
+            )
+        ) or ""
+    except Exception:
+        try:
+            return (await page.evaluate("() => (document.body && document.body.innerText) || ''")) or ""
+        except Exception:
+            return ""
+
+
+def _domain_block_reason_from_text(t: str) -> str | None:
+    """Classify page/error text as domain rejection (xAI copy included)."""
+    low = (t or "").lower()
+    if not low:
+        return None
+    # xAI exact: "Your email domain X has been rejected. Please use a different email address..."
+    if "domain" in low and "rejected" in low:
+        return "email domain has been rejected"
+    if "has been rejected" in low and ("email" in low or "domain" in low):
+        return "has been rejected"
+    needles = (
+        "use a different email address",
+        "use a different email domain",
+        "email domain is not allowed",
+        "domain is not allowed to sign up",
+        "domain is not allowed",
+        "email domain not allowed",
+        "not allowed to sign up",
+        "disposable email",
+        "email provider is not allowed",
+        "invalid email domain",
+        "email address is not allowed",
+        "domain has been rejected",
+        "domain was rejected",
+        "domain is rejected",
+        "contact support@x.ai",
+    )
+    for n in needles:
+        if n not in low:
+            continue
+        if n in ("use a different email address", "contact support@x.ai"):
+            if "domain" in low or "rejected" in low:
+                return n
+            continue
+        return n
+    if "domain" in low and ("not allowed" in low or "not permitted" in low or "blocked" in low):
+        if "email" in low or "sign up" in low or "signup" in low:
+            return "domain + not allowed"
+    return None
+
+
+async def page_has_domain_block(page) -> str | None:
+    """Detect xAI banner when email domain is rejected."""
+    return _domain_block_reason_from_text(await _page_error_text(page))
+
+
+async def raise_if_domain_blocked(page, attempt: int = 0) -> None:
+    """If domain-reject banner present → screenshot + raise domain_not_allowed."""
+    dom_block = await page_has_domain_block(page)
+    if not dom_block:
+        return
+    try:
+        await screenshot(page, attempt, "domain_blocked")
+    except Exception:
+        pass
+    raise RuntimeError(f"domain_not_allowed: {dom_block}")
+
+
 async def wait_otp_imap_keepalive(
     page, email_addr: str, timeout_s: int, since_ts: float, attempt: int
 ) -> str | None:
-    """Poll IMAP in a thread while gently keeping the browser page awake.
+    """Poll OTP (IMAP or GPTMail) in a thread while keeping the browser page awake.
 
     Long idle during OTP wait can leave Camoufox/React inputs sticky (~flaky fill).
     """
     loop = asyncio.get_event_loop()
-    fut = loop.run_in_executor(
-        None,
-        lambda: read_otp_from_imap_sync(email_addr, timeout_s, since_ts),
-    )
+    if EMAIL_MODE == "gptmail":
+        poll_fn = lambda: read_otp_from_gptmail_sync(email_addr, timeout_s, since_ts)
+    else:
+        poll_fn = lambda: read_otp_from_imap_sync(email_addr, timeout_s, since_ts)
+    fut = loop.run_in_executor(None, poll_fn)
     tick = 0
     while not fut.done():
         tick += 1
@@ -2044,7 +2556,7 @@ async def wait_otp_imap_keepalive(
                     pass
             # Confirm OTP field still present
             if tick % 4 == 0 and not await _otp_inputs_ready(page):
-                print(f"[{attempt}] WARN: OTP inputs missing during IMAP wait", flush=True)
+                print(f"[{attempt}] WARN: OTP inputs missing during OTP wait", flush=True)
         except Exception as e:
             print(f"[{attempt}] page keep-alive warn: {e}", flush=True)
         try:
@@ -2122,15 +2634,21 @@ async def do_signup(page, email_addr: str, password: str, attempt: int) -> bool:
         await page.locator('button[type="submit"]').filter(has_text=re.compile(r"^sign up$", re.I)).click(timeout=5000)
     except Exception:
         await click_text_button(page, ["Sign up"], exclude=["Google", "Apple", "email", "X"])
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(1.2)
+    # Fail-fast on domain reject (don't burn 20s waiting for OTP)
+    await raise_if_domain_blocked(page, attempt)
 
-    # Wait for OTP input: name=code autocomplete=one-time-code
-    code_sel = await wait_for_selector_any(
-        page,
-        ['input[name="code"]', 'input[autocomplete="one-time-code"]'],
-        20000,
-    )
+    # Wait for OTP — poll domain-reject banner every tick (xAI often shows red text, no OTP)
+    otp_sels = ['input[name="code"]', 'input[autocomplete="one-time-code"]']
+    code_sel = None
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        await raise_if_domain_blocked(page, attempt)
+        code_sel = await wait_for_selector_any(page, otp_sels, 1500)
+        if code_sel:
+            break
     if not code_sel:
+        await raise_if_domain_blocked(page, attempt)
         await screenshot(page, attempt, "no_otp_input")
         # maybe turnstile blocked submit
         await handle_turnstile(page, attempt, max_wait=15)
@@ -2138,16 +2656,20 @@ async def do_signup(page, email_addr: str, password: str, attempt: int) -> bool:
             await page.locator('button[type="submit"]').filter(has_text=re.compile(r"^sign up$", re.I)).click(timeout=3000)
         except Exception:
             pass
-        code_sel = await wait_for_selector_any(
-            page,
-            ['input[name="code"]', 'input[autocomplete="one-time-code"]'],
-            15000,
-        )
+        await asyncio.sleep(1.0)
+        await raise_if_domain_blocked(page, attempt)
+        code_sel = await wait_for_selector_any(page, otp_sels, 10000)
     if not code_sel:
+        await raise_if_domain_blocked(page, attempt)
         await screenshot(page, attempt, "otp_input_missing")
+        # last chance: classify body text so log is domain_not_allowed not OTP missing
+        body = await _page_error_text(page)
+        reason = _domain_block_reason_from_text(body)
+        if reason:
+            raise RuntimeError(f"domain_not_allowed: {reason}")
         raise RuntimeError("OTP input never appeared after Sign up")
 
-    emit_progress(attempt, "wait_otp", "Waiting for xAI confirmation code via IMAP", email_addr)
+    emit_progress(attempt, "wait_otp", f"Waiting for xAI confirmation code via {'GPTMAIL' if EMAIL_MODE == 'gptmail' else 'IMAP'}", email_addr)
     otp = await wait_otp_imap_keepalive(
         page, email_addr, OTP_TIMEOUT_S, otp_wait_started - 15, attempt
     )
@@ -2881,8 +3403,10 @@ async def _do_register(attempt_num: int) -> dict | None:
     async with if_lock:
         _in_flight += 1
     email_addr = ""
+    # sticky gptmail domain per concurrent slot
+    worker_slot = (max(1, attempt_num) - 1) % max(1, CONCURRENT)
     try:
-        email_addr = await generate_email()
+        email_addr = await generate_email(worker_slot=worker_slot)
         password = ACCOUNT_PASSWORD
         proxy_url, proxy_id = await next_proxy()
         _attempt_proxy[attempt_num] = proxy_id
@@ -2915,6 +3439,29 @@ async def _do_register(attempt_num: int) -> dict | None:
                 await save_failed_to_file(attempt_num, email_addr, str(e)[:400])
             except Exception:
                 pass
+            # gptmail: domain rejected → permanent block + next account new domain
+            if EMAIL_MODE == "gptmail":
+                low = str(e).lower()
+                if (
+                    "domain_not_allowed" in low
+                    or "domain is not allowed" in low
+                    or "email domain is not allowed" in low
+                    or "not allowed to sign up" in low
+                    or "disposable email" in low
+                    or "has been rejected" in low
+                    or "domain has been rejected" in low
+                    or "use a different email" in low
+                    or "rejected" in low and "domain" in low
+                ):
+                    dom = email_addr.split("@")[-1] if "@" in email_addr else ""
+                    # prefer domain named in xAI error text if present
+                    m = re.search(
+                        r"email domain\s+([a-z0-9][a-z0-9._-]*\.[a-z0-9.-]+)\s+has been rejected",
+                        low,
+                    )
+                    if m:
+                        dom = m.group(1).strip(".")
+                    gptmail_block_domain(dom, reason=str(e)[:120], worker_slot=worker_slot)
             return None
     finally:
         async with if_lock:
@@ -3207,17 +3754,23 @@ def _prompt_yes_no(label: str, default: bool = True) -> bool:
 
 async def main():
     global CONCURRENT
-    if not IMAP_USER or not IMAP_PASS:
-        print("ERROR: set GROK_IMAP_USER and GROK_IMAP_PASS in .env", flush=True)
-        sys.exit(1)
+    if EMAIL_MODE in ("domain", "plus_trick"):
+        if not IMAP_USER or not IMAP_PASS:
+            print("ERROR: set GROK_IMAP_USER and GROK_IMAP_PASS in .env", flush=True)
+            sys.exit(1)
     if EMAIL_MODE == "domain" and not EMAIL_DOMAIN:
         print("ERROR: set GROK_EMAIL_DOMAIN for domain mode", flush=True)
         sys.exit(1)
     if EMAIL_MODE == "plus_trick" and not (GMAIL_BASE or IMAP_USER):
         print("ERROR: set GROK_GMAIL_BASE or GROK_IMAP_USER for plus_trick", flush=True)
         sys.exit(1)
+    if EMAIL_MODE == "gptmail" and not GPTMAIL_API:
+        print("ERROR: set GROK_GPTMAIL_API for gptmail mode", flush=True)
+        sys.exit(1)
 
     _load_used_emails()
+    if EMAIL_MODE == "gptmail":
+        _load_blocked_domains()
     known = len(_used_emails)
 
     print("=" * 60, flush=True)
@@ -3226,9 +3779,13 @@ async def main():
     print(f"  Email mode : {EMAIL_MODE}", flush=True)
     if EMAIL_MODE == "domain":
         print(f"  Domain     : @{EMAIL_DOMAIN}", flush=True)
-    else:
+        print(f"  IMAP       : {IMAP_USER} @ {IMAP_HOST}:{IMAP_PORT}", flush=True)
+    elif EMAIL_MODE == "plus_trick":
         print(f"  Gmail base : {GMAIL_BASE or IMAP_USER}", flush=True)
-    print(f"  IMAP       : {IMAP_USER} @ {IMAP_HOST}:{IMAP_PORT}", flush=True)
+        print(f"  IMAP       : {IMAP_USER} @ {IMAP_HOST}:{IMAP_PORT}", flush=True)
+    else:
+        print(f"  GPTMail    : {GPTMAIL_API}", flush=True)
+        print(f"  Pin domain : {GPTMAIL_DOMAIN or '(auto pool)'}", flush=True)
     print(f"  Password   : {'*' * max(0, len(ACCOUNT_PASSWORD) - 2)}{ACCOUNT_PASSWORD[-2:]}", flush=True)
     print(f"  Headless   : {HEADLESS}", flush=True)
     print(

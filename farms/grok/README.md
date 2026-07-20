@@ -5,8 +5,8 @@ Independent of poolprox3 — copy this folder to any VPS and run.
 
 ## What it does
 
-1. Creates catch-all (or Gmail plus-trick) emails  
-2. Registers at `accounts.x.ai` (OTP via IMAP)  
+1. Creates emails: catch-all / Gmail plus-trick (**IMAP**) or **gptmail** (API, no IMAP)  
+2. Registers at `accounts.x.ai` (OTP via IMAP or GPTMail)  
 3. Completes profile + password + Turnstile  
 4. Runs Grok CLI OAuth (PKCE) → `access_token` + `refresh_token`  
 5. Writes results into a **new batch folder** each run (JSON + TXT)
@@ -56,8 +56,10 @@ python farm.py -n 20 -c 2 -y
 |----------|---------|--------|
 | `GROK_IMAP_USER` | `you@gmail.com` | Inbox that receives OTP |
 | `GROK_IMAP_PASS` | app password | Gmail App Password |
-| `GROK_EMAIL_MODE` | `domain` | or `plus_trick` |
-| `GROK_EMAIL_DOMAIN` | `koemail.my.id` | catch-all (no `@`) |
+| `GROK_EMAIL_MODE` | `domain` | `domain` \| `plus_trick` \| **`gptmail`** |
+| `GROK_EMAIL_DOMAIN` | `koemail.my.id` | catch-all (no `@`) — domain mode |
+| `GROK_GPTMAIL_API` | `https://mail.chatgpt.org.uk` | gptmail only |
+| `GROK_GPTMAIL_DOMAIN` | (empty) | pin one domain; empty = auto pool + rotate on block |
 | `GROK_PASSWORD` | `$Priyo000` | password for all accounts |
 | `GROK_MAX_ACCOUNTS` | `10` | how many this run |
 | `GROK_CONCURRENT` | `1` | browsers in parallel (start with 1–2) |
