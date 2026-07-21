@@ -25,6 +25,8 @@ class JobDef:
     entry: str
     description: str = ""
     env_prefix: str = ""  # GROK_ / ENTER_ — for hub env mapping
+    # False = never auto-connect / inject / mid-batch WARP (e.g. outlook captcha flaky on CF)
+    warp_enabled: bool = True
 
     def python(self) -> Path:
         """Hub .venv first (global deps), then farm venv, then sys."""
@@ -48,6 +50,7 @@ class JobDef:
 
 
 _GROK = _job_cwd("grok", "AUTOMATION_GROK_FARM")
+_OUTLOOK = _job_cwd("outlook", "AUTOMATION_OUTLOOK_FARM")
 
 JOBS: dict[str, JobDef] = {
     "grok": JobDef(
@@ -65,6 +68,24 @@ JOBS: dict[str, JobDef] = {
         entry="farm.py",
         description="Alias of grok",
         env_prefix="GROK_",
+    ),
+    "outlook": JobDef(
+        id="outlook",
+        name="outlook-farm",
+        cwd=_OUTLOOK,
+        entry="farm.py",
+        description="Outlook MSA signup (IMAP + PX hold) — WARP disabled",
+        env_prefix="OUTLOOK_",
+        warp_enabled=False,
+    ),
+    "outlook-farm": JobDef(
+        id="outlook",
+        name="outlook-farm",
+        cwd=_OUTLOOK,
+        entry="farm.py",
+        description="Alias of outlook — WARP disabled",
+        env_prefix="OUTLOOK_",
+        warp_enabled=False,
     ),
 }
 

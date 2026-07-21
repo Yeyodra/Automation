@@ -174,6 +174,7 @@ class HubApp(App[None]):
         jobs = ", ".join(j.id for j in list_jobs()) or "(none)"
         self._log(f"Hub ready. Jobs: {jobs}")
         self._log("everyN LIVE sync: ubah -c → everyN ikut (kalau everyN≠0). 0=off.")
+        self._log("Run = auto WARP connect · everyN>0 = mid-batch rotate · Rotate = manual IP")
         self._log("Stop [S]=kill farm · Status/Rotate=manual WARP · Quit=close HUD")
         self._log("Grok Email: klik IMAP (catch-all) atau GPTMail (temp API) — hanya job grok.")
         self._sync_every_n_ui(silent=True)
@@ -433,12 +434,23 @@ class HubApp(App[None]):
             return
         job, args, dry, n, c, every_n, policy_note = self._read_form()
         try:
-            get_job(job)
+            jdef = get_job(job)
         except KeyError as e:
             self._log(f"[error] {e}")
-            self._log("  Tip: job yang ada cuma 'grok' (enter belum).")
+            known = ", ".join(j.id for j in list_jobs()) or "(none)"
+            self._log(f"  Tip: known jobs: {known}")
             self._status("Unknown job")
             return
+        # Jobs with warp_enabled=False (outlook): ignore form everyN / no auto-connect
+        warp_ok = bool(getattr(jdef, "warp_enabled", True))
+        if not warp_ok:
+            if every_n > 0:
+                self._log(
+                    f"[hub] WARP disabled for job={jdef.id} "
+                    f"— everyN {every_n} ignored (form c={c} still used for farm only)"
+                )
+            every_n = 0
+            policy_note = ""
         self._busy = True
         self._reset_progress(0 if dry else n)
         if policy_note:
@@ -446,6 +458,7 @@ class HubApp(App[None]):
         self._status(
             f"Running {job} n={n} c={c}"
             + (f" everyN={every_n}" if every_n else " everyN=off")
+            + ("" if warp_ok else " WARP=off")
             + (" dry" if dry else "")
         )
         env_overrides: dict[str, str] | None = None
@@ -456,12 +469,18 @@ class HubApp(App[None]):
                 "EMAIL_MODE": mode,
             }
             self._log(f"[hub] grok EMAIL_MODE={mode} (HUD click)")
+        if not dry:
+            if warp_ok:
+                self._log("[hub] WARP: auto-connect on job start")
+            else:
+                self._log(f"[hub] WARP: skipped for job={jdef.id} (warp_enabled=false)")
         self._log(
-            f"-- run {job}  {' '.join(args)}  c={c} everyN={every_n or 'off'} dry={dry}"
+            f"-- run {job}  {' '.join(args)}  c={c} everyN={every_n or 'off'} "
+            f"warp={'on' if warp_ok else 'off'} dry={dry}"
         )
         self._log_widget().focus()
         self._log_widget().auto_scroll = True
-        self._run_job_worker(job, args, dry, every_n, env_overrides)
+        self._run_job_worker(job, args, dry, every_n, env_overrides, warp_ok)
 
     def action_stop_job(self) -> None:
         """Global stop: kill farm process tree (Camoufox children)."""
@@ -489,14 +508,17 @@ class HubApp(App[None]):
         dry: bool,
         every_n: int = 0,
         env_overrides: dict[str, str] | None = None,
+        warp_ok: bool = True,
     ) -> None:
         try:
             result = run_job(
                 job,
                 args,
-                warp_connect=every_n > 0,
-                warp_rotate=False,  # pre-rotate: CLI --warp-rotate only
-                warp_every_n=every_n,
+                # Default jobs: connect WARP on start (even if everyN=0).
+                # Jobs with warp_enabled=False (outlook): never connect / inject / rotate.
+                warp_connect=bool(warp_ok),
+                warp_rotate=False,
+                warp_every_n=(every_n if warp_ok else 0),
                 dry_run=dry,
                 log=self._thread_log,
                 env_overrides=env_overrides,

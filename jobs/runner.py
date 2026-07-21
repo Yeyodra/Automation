@@ -87,16 +87,32 @@ def run_job(
 
     total_n = extract_count(farm_args, default=1)
     conc = extract_concurrent(farm_args, default=1)
-    every_raw = 0 if warp_every_n is None else max(0, int(warp_every_n))
-    every, every_note = normalize_every_n(conc, every_raw)
 
-    if every > 0:
-        env["WARP_EVERY_N"] = str(every)
+    # Per-job WARP kill-switch (outlook: captcha flaky on Cloudflare exits)
+    if not getattr(job, "warp_enabled", True):
+        if warp_connect or warp_rotate or (warp_every_n is not None and int(warp_every_n) > 0):
+            log(f"[hub] WARP disabled for job={job.id} (skip connect/rotate/everyN)")
+        warp_connect = False
+        warp_rotate = False
+        warp_every_n = 0
+        every_raw = 0
+        every, every_note = 0, ""
+        # hard-off inject so farm cannot mid-batch rotate from env leftovers
+        env["WARP_EVERY_N"] = "0"
         if prefix:
-            env[f"{prefix}WARP_EVERY_N"] = str(every)
+            env[f"{prefix}WARP_EVERY_N"] = "0"
             env[f"{prefix}CONCURRENT"] = str(conc)
-        env["GROK_WARP_EVERY_N"] = str(every)
-        env["GROK_CONCURRENT"] = str(conc)
+    else:
+        every_raw = 0 if warp_every_n is None else max(0, int(warp_every_n))
+        every, every_note = normalize_every_n(conc, every_raw)
+
+        if every > 0:
+            env["WARP_EVERY_N"] = str(every)
+            if prefix:
+                env[f"{prefix}WARP_EVERY_N"] = str(every)
+                env[f"{prefix}CONCURRENT"] = str(conc)
+            env["GROK_WARP_EVERY_N"] = str(every)
+            env["GROK_CONCURRENT"] = str(conc)
 
     cmd = [str(py), str(entry), *farm_args]
 
@@ -158,6 +174,8 @@ def run_job(
     env["GROK_UI"] = "log"
     env["GROK_VERBOSE"] = env.get("GROK_VERBOSE") or "true"
     env["ENTER_UI"] = "log"
+    env["OUTLOOK_UI"] = "log"
+    env["OUTLOOK_VERBOSE"] = env.get("OUTLOOK_VERBOSE") or "true"
 
     log("[hub] starting farm process (one batch)…")
     log("[hub] stop: HUD Stop / S key / python -m jobs stop")

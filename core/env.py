@@ -1,4 +1,4 @@
-"""Global hub .env — shared secrets + map to job prefixes (GROK_*, ENTER_*).
+"""Global hub .env — shared secrets + map to job prefixes (GROK_*, ENTER_*, OUTLOOK_*).
 
 Load order for a job subprocess:
   1) process env (already set)
