@@ -1,0 +1,16 @@
+# Enter farmer proxy list — copy to proxies.txt:
+#   copy proxies.txt.example proxies.txt
+#
+# One proxy per line. Blank lines and # comments ignored.
+# Formats:
+#   http://user:pass@host:port
+#   socks5://user:pass@host:port
+#   host:port
+#   host:port:user:pass
+#   user:pass@host:port
+#
+# Round-robin: each new account takes the next proxy.
+# Recommended for Cloudflare Turnstile on auth.converge.ai
+
+# http://user:pass@1.2.3.4:8080
+# socks5://user:pass@5.6.7.8:1080

@@ -1,0 +1,4 @@
+﻿# Docs only — install at hub root, not here.
+camoufox[geoip]==0.4.11
+playwright==1.58.0
+python-dotenv>=1.0.0
