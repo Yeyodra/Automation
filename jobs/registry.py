@@ -51,6 +51,7 @@ class JobDef:
 
 _GROK = _job_cwd("grok", "AUTOMATION_GROK_FARM")
 _OUTLOOK = _job_cwd("outlook", "AUTOMATION_OUTLOOK_FARM")
+_ENTER = _job_cwd("enter", "AUTOMATION_ENTER_FARM")
 
 JOBS: dict[str, JobDef] = {
     "grok": JobDef(
@@ -86,6 +87,22 @@ JOBS: dict[str, JobDef] = {
         description="Alias of outlook — WARP disabled",
         env_prefix="OUTLOOK_",
         warp_enabled=False,
+    ),
+    "enter": JobDef(
+        id="enter",
+        name="enter-farm",
+        cwd=_ENTER,
+        entry="farm.py",
+        description="Enter/Converge farmer — farms/enter (gift→Auth0→OTP→ek_)",
+        env_prefix="ENTER_",
+    ),
+    "enter-farm": JobDef(
+        id="enter",
+        name="enter-farm",
+        cwd=_ENTER,
+        entry="farm.py",
+        description="Alias of enter",
+        env_prefix="ENTER_",
     ),
 }
 
