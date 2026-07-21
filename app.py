@@ -1,4 +1,4 @@
-﻿"""Automation hub — Textual HUD (default) + thin CLI.
+"""Automation hub — Textual HUD (default) + thin CLI.
 
   python app.py                 # TUI
   python app.py --no-tui list
@@ -63,7 +63,7 @@ class HubApp(App[None]):
     }
     #form {
         height: auto;
-        max-height: 12;
+        max-height: 16;
         border: solid $accent;
         padding: 0 1;
         margin: 0 0 1 0;
@@ -75,6 +75,9 @@ class HubApp(App[None]):
     #email-row { height: 3; }
     #email-row.hidden { display: none; }
     #email-row Button { min-width: 12; margin-right: 1; }
+    #gift-row { height: 3; }
+    #gift-row.hidden { display: none; }
+    #btn-job-cycle { min-width: 5; margin: 0 1 0 0; }
     #progress {
         height: auto;
         min-height: 3;
@@ -111,6 +114,7 @@ class HubApp(App[None]):
         Binding("W", "warp_rotate", "Rotate", show=True),
         Binding("c", "clear_log", "Clear", show=True),
         Binding("l", "list_jobs", "Jobs", show=True),
+        Binding("j", "cycle_job", "Job↻", show=True),
         Binding("f", "focus_log", "Log", show=True),
         Binding("end", "log_end", "End", show=False),
         Binding("home", "log_home", "Home", show=False),
@@ -118,12 +122,15 @@ class HubApp(App[None]):
         Binding("pagedown", "log_page_down", "PgDn", show=False),
     ]
 
+    # Jobs that support IMAP domain vs GPTMail toggle in HUD
+    _EMAIL_TOGGLE_JOBS = frozenset({"grok", "enter"})
+
     def __init__(self) -> None:
         super().__init__()
         self._progress = BatchProgress()
         self._syncing_form = False  # prevent Input.Changed feedback loop
-        # grok-only: domain/plus_trick (IMAP) vs gptmail (API)
-        self._grok_email_mode: str = "domain"
+        # per-job email mode: domain (IMAP) | gptmail — seeded from hub .env on mount
+        self._email_mode: dict[str, str] = {"grok": "domain", "enter": "gptmail"}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -131,14 +138,15 @@ class HubApp(App[None]):
             with Vertical(id="form"):
                 with Horizontal(classes="row"):
                     yield Label("Job")
-                    yield Input(value="grok", id="job", placeholder="grok")
+                    yield Input(value="grok", id="job", placeholder="grok|enter|outlook")
+                    yield Button("↻", id="btn-job-cycle", variant="primary")
                     yield Label("  -n")
                     yield Input(value="20", id="count", placeholder="20")
                     yield Label("  -c")
                     yield Input(value="3", id="concurrent", placeholder="3")
                 with Horizontal(classes="row"):
                     yield Label("Args")
-                    yield Input(value="-y", id="extra", placeholder="-y --headless")
+                    yield Input(value="-y", id="extra", placeholder="-y --headed")
                     yield Label(" everyN")
                     yield Input(
                         value="3",
@@ -146,12 +154,20 @@ class HubApp(App[None]):
                         placeholder="0=off else =c",
                     )
                     yield Checkbox("Dry-run", id="chk-dry", value=False)
-                # grok-only email provider (shown when Job=grok)
+                # Email provider (shown for grok + enter)
                 with Horizontal(id="email-row", classes="row"):
                     yield Label("Email")
                     yield Button("IMAP", id="btn-email-imap", variant="success")
                     yield Button("GPTMail", id="btn-email-gptmail", variant="default")
-                    yield Label("  (grok only)", id="email-hint")
+                    yield Label("  (grok/enter)", id="email-hint")
+                # Enter gift code (shown when Job=enter)
+                with Horizontal(id="gift-row", classes="row"):
+                    yield Label("Gift")
+                    yield Input(
+                        value="",
+                        id="gift-code",
+                        placeholder="ENTER_GIFT_CODE (referral)",
+                    )
             yield ProgressPanel("Progress: idle — set -n then Run", id="progress")
             with Horizontal(id="actions"):
                 yield Button("Run [R]", id="btn-run", variant="success")
@@ -165,7 +181,7 @@ class HubApp(App[None]):
             log.can_focus = True
             yield log
         yield StatusBar(
-            "everyN=c (live) · 0=off · S=Stop · R=Run · Q=Quit"
+            "J=cycle job · everyN=c · S=Stop · R=Run · Q=Quit"
         )
         yield Footer()
 
@@ -175,10 +191,15 @@ class HubApp(App[None]):
         self._log(f"Hub ready. Jobs: {jobs}")
         self._log("everyN LIVE sync: ubah -c → everyN ikut (kalau everyN≠0). 0=off.")
         self._log("Run = auto WARP connect · everyN>0 = mid-batch rotate · Rotate = manual IP")
+        self._log("Job ↻ / [J] = cycle · Email IMAP|GPTMail (grok/enter) · Gift row (enter)")
+        self._seed_modes_from_env()
+        self._seed_gift_from_env()
+
         self._log("Stop [S]=kill farm · Status/Rotate=manual WARP · Quit=close HUD")
         self._log("Grok Email: klik IMAP (catch-all) atau GPTMail (temp API) — hanya job grok.")
         self._sync_every_n_ui(silent=True)
         self._sync_email_row()
+        self._sync_gift_row()
         self._paint_progress()
         self._warp_worker("status", quiet=True)
 
@@ -188,20 +209,88 @@ class HubApp(App[None]):
         except Exception:
             return "grok"
 
+    def _job_cycle_ids(self) -> list[str]:
+        ids = [j.id for j in list_jobs()]
+        return ids or ["grok"]
+
+    def _seed_modes_from_env(self) -> None:
+        """Seed email toggles from hub .env (GROK_*/ENTER_* or shared EMAIL_MODE)."""
+        try:
+            from core.env import parse_env_file, HUB_ENV
+
+            hub = parse_env_file(HUB_ENV)
+        except Exception:
+            hub = {}
+        shared = (hub.get("EMAIL_MODE") or "domain").strip().lower()
+        for jid, key, default in (
+            ("grok", "GROK_EMAIL_MODE", shared if shared in ("domain", "gptmail") else "domain"),
+            ("enter", "ENTER_EMAIL_MODE", "gptmail"),
+        ):
+            raw = (hub.get(key) or default or "domain").strip().lower()
+            if raw not in ("domain", "plus_trick", "gptmail"):
+                raw = default if default in ("domain", "gptmail") else "domain"
+            # HUD only toggles domain vs gptmail (plus_trick → IMAP/domain button)
+            self._email_mode[jid] = "gptmail" if raw == "gptmail" else "domain"
+
+    def _seed_gift_from_env(self) -> None:
+        try:
+            from core.env import parse_env_file, HUB_ENV
+
+            hub = parse_env_file(HUB_ENV)
+            gift = (hub.get("ENTER_GIFT_CODE") or "").strip()
+        except Exception:
+            gift = ""
+        try:
+            inp = self.query_one("#gift-code", Input)
+            if gift and not inp.value.strip():
+                inp.value = gift
+        except Exception:
+            pass
+
+    def _email_mode_for(self, job: str | None = None) -> str:
+        jid = (job or self._job_id()).lower()
+        mode = self._email_mode.get(jid, "domain")
+        return mode if mode in ("domain", "gptmail") else "domain"
+
+    def _set_email_mode(self, mode: str) -> None:
+        jid = self._job_id()
+        if jid not in self._EMAIL_TOGGLE_JOBS:
+            return
+        if mode not in ("domain", "gptmail"):
+            return
+        self._email_mode[jid] = mode
+        self._paint_email_buttons()
+        label = "GPTMail (API)" if mode == "gptmail" else "IMAP (domain)"
+        self._status(f"{jid} email: {label}")
+        self._log(f"[hub] {jid} EMAIL_MODE → {mode}")
+
     def _sync_email_row(self) -> None:
-        """Show IMAP/GPTMail toggles only when Job=grok."""
+        """Show IMAP/GPTMail toggles for grok + enter."""
         try:
             row = self.query_one("#email-row", Horizontal)
+            hint = self.query_one("#email-hint", Label)
         except Exception:
             return
-        is_grok = self._job_id() == "grok"
-        row.set_class(not is_grok, "hidden")
-        if is_grok:
+        jid = self._job_id()
+        show = jid in self._EMAIL_TOGGLE_JOBS
+        row.set_class(not show, "hidden")
+        if show:
+            try:
+                hint.update(f"  ({jid})")
+            except Exception:
+                pass
             self._paint_email_buttons()
 
+    def _sync_gift_row(self) -> None:
+        """Show gift code field only for enter."""
+        try:
+            row = self.query_one("#gift-row", Horizontal)
+        except Exception:
+            return
+        row.set_class(self._job_id() != "enter", "hidden")
+
     def _paint_email_buttons(self) -> None:
-        mode = self._grok_email_mode if self._grok_email_mode in ("domain", "gptmail") else "domain"
-        self._grok_email_mode = mode
+        mode = self._email_mode_for()
         try:
             btn_imap = self.query_one("#btn-email-imap", Button)
             btn_gpt = self.query_one("#btn-email-gptmail", Button)
@@ -213,24 +302,43 @@ class HubApp(App[None]):
     @on(Input.Changed, "#job")
     def on_job_changed(self, _event: Input.Changed) -> None:
         self._sync_email_row()
+        self._sync_gift_row()
+
+    @on(Button.Pressed, "#btn-job-cycle")
+    def on_job_cycle_btn(self) -> None:
+        self.action_cycle_job()
+
+    def action_cycle_job(self) -> None:
+        """Cycle Job field: grok → enter → outlook → …"""
+        ids = self._job_cycle_ids()
+        if not ids:
+            return
+        cur = self._job_id()
+        try:
+            idx = ids.index(cur)
+            nxt = ids[(idx + 1) % len(ids)]
+        except ValueError:
+            nxt = ids[0]
+        try:
+            self.query_one("#job", Input).value = nxt
+        except Exception:
+            return
+        self._sync_email_row()
+        self._sync_gift_row()
+        self._status(f"Job → {nxt}")
+        self._log(f"[hub] job cycle → {nxt}")
 
     @on(Button.Pressed, "#btn-email-imap")
     def on_email_imap(self) -> None:
-        if self._job_id() != "grok":
+        if self._job_id() not in self._EMAIL_TOGGLE_JOBS:
             return
-        self._grok_email_mode = "domain"
-        self._paint_email_buttons()
-        self._status("Grok email: IMAP (domain catch-all)")
-        self._log("[hub] grok email mode → domain (IMAP)")
+        self._set_email_mode("domain")
 
     @on(Button.Pressed, "#btn-email-gptmail")
     def on_email_gptmail(self) -> None:
-        if self._job_id() != "grok":
+        if self._job_id() not in self._EMAIL_TOGGLE_JOBS:
             return
-        self._grok_email_mode = "gptmail"
-        self._paint_email_buttons()
-        self._status("Grok email: GPTMail (API, no IMAP)")
-        self._log("[hub] grok email mode → gptmail")
+        self._set_email_mode("gptmail")
 
     def _parse_int_field(self, field_id: str, default: int = 1) -> int:
         try:
@@ -461,14 +569,28 @@ class HubApp(App[None]):
             + ("" if warp_ok else " WARP=off")
             + (" dry" if dry else "")
         )
-        env_overrides: dict[str, str] | None = None
-        if job.lower() == "grok":
-            mode = self._grok_email_mode if self._grok_email_mode in ("domain", "gptmail") else "domain"
-            env_overrides = {
-                "GROK_EMAIL_MODE": mode,
-                "EMAIL_MODE": mode,
-            }
-            self._log(f"[hub] grok EMAIL_MODE={mode} (HUD click)")
+        env_overrides: dict[str, str] = {}
+        jlow = job.lower()
+        if jlow in self._EMAIL_TOGGLE_JOBS:
+            mode = self._email_mode_for(jlow)
+            if jlow == "grok":
+                env_overrides["GROK_EMAIL_MODE"] = mode
+                env_overrides["EMAIL_MODE"] = mode
+            elif jlow == "enter":
+                env_overrides["ENTER_EMAIL_MODE"] = mode
+                # do NOT override shared EMAIL_MODE (keep grok/outlook domain)
+            self._log(f"[hub] {jlow} EMAIL_MODE={mode} (HUD)")
+        if jlow == "enter":
+            try:
+                gift = self.query_one("#gift-code", Input).value.strip()
+            except Exception:
+                gift = ""
+            if gift:
+                env_overrides["ENTER_GIFT_CODE"] = gift
+                self._log(f"[hub] ENTER_GIFT_CODE set ({gift[:4]}…{gift[-2:] if len(gift) > 6 else ''})")
+            else:
+                self._log("[hub] WARN: Gift empty — farm uses ENTER_GIFT_CODE from .env / default")
+        env_ov: dict[str, str] | None = env_overrides or None
         if not dry:
             if warp_ok:
                 self._log("[hub] WARP: auto-connect on job start")
@@ -480,7 +602,7 @@ class HubApp(App[None]):
         )
         self._log_widget().focus()
         self._log_widget().auto_scroll = True
-        self._run_job_worker(job, args, dry, every_n, env_overrides, warp_ok)
+        self._run_job_worker(job, args, dry, every_n, env_ov, warp_ok)
 
     def action_stop_job(self) -> None:
         """Global stop: kill farm process tree (Camoufox children)."""
