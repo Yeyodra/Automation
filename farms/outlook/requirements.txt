@@ -1,0 +1,4 @@
+# Docs only — install at hub root, not here.
+# python-dotenv already in Automation/requirements.txt
+# Browser stack (when automation lands): camoufox[geoip], playwright — same hub pins.
+python-dotenv>=1.0.0
