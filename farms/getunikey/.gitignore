@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+results/
+screenshots/
+logs/
+*.log
+.DS_Store
+# secrets — keep .example only
+google_accounts.txt
+used_google.txt

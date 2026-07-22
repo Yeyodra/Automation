@@ -1,0 +1,3 @@
+# Copy to google_accounts.txt (gitignored). Format: email:password
+# user@gmail.com:secretpass
+# other@domain.com:pass:with:colons

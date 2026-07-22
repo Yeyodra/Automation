@@ -1,0 +1,5 @@
+# Docs only — install at hub root, not here.
+python-dotenv>=1.0.0
+# Product flow later may need:
+# camoufox[geoip]==0.4.11
+# playwright==1.58.0
