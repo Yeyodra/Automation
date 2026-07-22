@@ -176,6 +176,8 @@ def run_job(
     env["ENTER_UI"] = "log"
     env["OUTLOOK_UI"] = "log"
     env["OUTLOOK_VERBOSE"] = env.get("OUTLOOK_VERBOSE") or "true"
+    env["GETUNIKEY_UI"] = "log"
+    env["GETUNIKEY_VERBOSE"] = env.get("GETUNIKEY_VERBOSE") or "true"
 
     log("[hub] starting farm process (one batch)…")
     log("[hub] stop: HUD Stop / S key / python -m jobs stop")

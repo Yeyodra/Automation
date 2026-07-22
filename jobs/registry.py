@@ -52,6 +52,7 @@ class JobDef:
 _GROK = _job_cwd("grok", "AUTOMATION_GROK_FARM")
 _OUTLOOK = _job_cwd("outlook", "AUTOMATION_OUTLOOK_FARM")
 _ENTER = _job_cwd("enter", "AUTOMATION_ENTER_FARM")
+_GETUNIKEY = _job_cwd("getunikey", "AUTOMATION_GETUNIKEY_FARM")
 
 JOBS: dict[str, JobDef] = {
     "grok": JobDef(
@@ -103,6 +104,22 @@ JOBS: dict[str, JobDef] = {
         entry="farm.py",
         description="Alias of enter",
         env_prefix="ENTER_",
+    ),
+    "getunikey": JobDef(
+        id="getunikey",
+        name="getunikey-farm",
+        cwd=_GETUNIKEY,
+        entry="farm.py",
+        description="GetUniKey farmer — farms/getunikey (scaffold; stub OK)",
+        env_prefix="GETUNIKEY_",
+    ),
+    "getunikey-farm": JobDef(
+        id="getunikey",
+        name="getunikey-farm",
+        cwd=_GETUNIKEY,
+        entry="farm.py",
+        description="Alias of getunikey",
+        env_prefix="GETUNIKEY_",
     ),
 }
 
