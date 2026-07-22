@@ -10,6 +10,7 @@ Any farm that prints the hub log contract is auto-tracked.
 
 from __future__ import annotations
 
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -21,6 +22,52 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Log, Static
+
+# Farm log contract: [HH:MM:SS] [id] step  …
+_RE_HUD_TS_STEP = re.compile(
+    r"^\[(?P<ts>\d{1,2}:\d{2}:\d{2})\]\s+\[(?P<id>\d+)\]\s+(?P<step>\S+)"
+)
+_RE_HUD_BARE_OK_FAIL = re.compile(r"^\[(?P<id>\d+)\]\s+(?P<step>OK|FAIL)\b", re.I)
+# Terminal outcomes only in HUD (detail stays in farms/*/results/*/farm.log)
+_HUD_SHOW_STEPS = frozenset(
+    {
+        "start",
+        "ok",
+        "success",
+        "done",
+        "saved",
+        "fail",
+        "failed",
+        "error",
+        "err",
+        "timeout",
+    }
+)
+
+
+def hud_show_line(msg: str) -> bool:
+    """Quiet HUD: hub + START/OK/FAIL + important WARP. Full log is on disk."""
+    raw = (msg or "").rstrip("\n")
+    if not raw.strip():
+        return False
+    low = raw.lower()
+    if low.startswith(("[hub]", "[jobctl]", "[error]")):
+        return True
+    if "warp every_n" in low or "warp wave" in low:
+        return True
+    if "warp: rotate" in low or "warp every_n rotate" in low:
+        return True
+    if low.startswith("[done]") or "exit=" in low and low.startswith("[hub]"):
+        return True
+    m = _RE_HUD_TS_STEP.match(raw.strip())
+    if m:
+        return m.group("step").lower() in _HUD_SHOW_STEPS
+    if _RE_HUD_BARE_OK_FAIL.match(raw.strip()):
+        return True
+    # Keep short hub tips / list_jobs lines (indented ok/MISSING)
+    if raw.startswith("  [") and ("ok]" in low or "missing]" in low):
+        return True
+    return False
 
 _HUB = Path(__file__).resolve().parent
 if str(_HUB) not in sys.path:
@@ -131,6 +178,8 @@ class HubApp(App[None]):
         self._syncing_form = False  # prevent Input.Changed feedback loop
         # per-job email mode: domain (IMAP) | gptmail — seeded from hub .env on mount
         self._email_mode: dict[str, str] = {"grok": "domain", "enter": "gptmail"}
+        # Log follow: pause when user scrolls up; End / Run resumes
+        self._log_follow: bool = True
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -177,11 +226,12 @@ class HubApp(App[None]):
                 yield Button("Jobs [L]", id="btn-list")
                 yield Button("Clear [C]", id="btn-clear")
                 yield Button("Quit [Q]", id="btn-quit")
-            log = Log(id="log", highlight=True, max_lines=5000, auto_scroll=True)
+            # Quiet HUD: short buffer, no rich highlight (n=1k/2k stays scrollable)
+            log = Log(id="log", highlight=False, max_lines=500, auto_scroll=False)
             log.can_focus = True
             yield log
         yield StatusBar(
-            "J=cycle job · everyN=c · S=Stop · R=Run · Q=Quit"
+            "J=cycle · quiet log · End=follow · S=Stop · R=Run · Q=Quit"
         )
         yield Footer()
 
@@ -192,6 +242,8 @@ class HubApp(App[None]):
         self._log("everyN LIVE sync: ubah -c → everyN ikut (kalau everyN≠0). 0=off.")
         self._log("Run = auto WARP connect · everyN>0 = mid-batch rotate · Rotate = manual IP")
         self._log("Job ↻ / [J] = cycle · Email IMAP|GPTMail (grok/enter) · Gift row (enter)")
+        self._log("Log quiet: START/OK/FAIL + hub/WARP only · full detail → farms/*/results/*/farm.log")
+        self._log("Scroll up = pause follow · End / Run = resume tail")
         self._seed_modes_from_env()
         self._seed_gift_from_env()
 
@@ -411,13 +463,29 @@ class HubApp(App[None]):
     def _log_widget(self) -> Log:
         return self.query_one("#log", Log)
 
+    def _log_near_bottom(self) -> bool:
+        """True if viewport is at (or near) the tail."""
+        try:
+            w = self._log_widget()
+            max_y = float(getattr(w, "max_scroll_y", 0) or 0)
+            y = float(getattr(w, "scroll_y", 0) or 0)
+            if max_y <= 0:
+                return True
+            return y >= max_y - 2.0
+        except Exception:
+            return True
+
     def _log(self, msg: str) -> None:
-        w = self._log_widget()
-        w.write_line(msg)
-        if w.auto_scroll:
-            w.scroll_end(animate=False)
-        if self._progress.ingest(msg):
+        """Ingest all lines for progress; display only quiet subset."""
+        raw = (msg or "").rstrip("\n")
+        if self._progress.ingest(raw):
             self._paint_progress()
+        if not hud_show_line(raw):
+            return
+        w = self._log_widget()
+        w.write_line(raw)
+        if self._log_follow:
+            w.scroll_end(animate=False)
 
     def _status(self, msg: str) -> None:
         self.query_one(StatusBar).set_status(msg)
@@ -430,19 +498,27 @@ class HubApp(App[None]):
 
     def action_focus_log(self) -> None:
         self._log_widget().focus()
-        self._status("Log focused — scroll wheel / PgUp / PgDn / End")
+        self._status("Log focused — PgUp pauses follow · End resumes tail")
 
     def action_log_end(self) -> None:
+        self._log_follow = True
         self._log_widget().scroll_end(animate=False)
+        self._status("Log follow ON (tail)")
 
     def action_log_home(self) -> None:
+        self._log_follow = False
         self._log_widget().scroll_home(animate=False)
+        self._status("Log follow OFF (reading history)")
 
     def action_log_page_up(self) -> None:
+        self._log_follow = False
         self._log_widget().scroll_page_up(animate=False)
 
     def action_log_page_down(self) -> None:
-        self._log_widget().scroll_page_down(animate=False)
+        w = self._log_widget()
+        w.scroll_page_down(animate=False)
+        if self._log_near_bottom():
+            self._log_follow = True
 
     def _read_form(self) -> tuple[str, list[str], bool, int, int, int, str | None]:
         """Returns job, args, dry, n, c, every_n, policy_note."""
@@ -527,7 +603,8 @@ class HubApp(App[None]):
 
     def action_clear_log(self) -> None:
         self.query_one("#log", Log).clear()
-        self._status("Log cleared")
+        self._log_follow = True
+        self._status("Log cleared · follow ON")
 
     def action_list_jobs(self) -> None:
         for j in list_jobs():
@@ -600,8 +677,9 @@ class HubApp(App[None]):
             f"-- run {job}  {' '.join(args)}  c={c} everyN={every_n or 'off'} "
             f"warp={'on' if warp_ok else 'off'} dry={dry}"
         )
+        self._log_follow = True
         self._log_widget().focus()
-        self._log_widget().auto_scroll = True
+        self._log_widget().scroll_end(animate=False)
         self._run_job_worker(job, args, dry, every_n, env_ov, warp_ok)
 
     def action_stop_job(self) -> None:
