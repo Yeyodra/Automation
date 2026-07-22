@@ -423,23 +423,31 @@ HUD = FarmHUD()
 
 
 def _infer_step(msg: str) -> str:
+    """Map alog text → short step label for HUD.
+
+    Do NOT tag intermediate retries / Auth0 risk blocks as FAIL.
+    Terminal failures use emit_failed → mark_fail (explicit FAIL step).
+    """
     low = f" {msg.lower()} "
     rules = (
         ("START", ("start ",)),
         ("RATE", ("rate limit", "cooldown", "rate-limit", "global cooldown")),
+        # Auth0 risk_control_blocked is recovery path, not terminal fail
+        ("RISK", ("risk_control", "risk block", "risk/", "access_denied", "error_description")),
         ("WARP", ("warp",)),
         ("EMAIL", ("email", "gptmail", "tempmail")),
         ("OTP", ("otp", "imap", "verification code")),
         ("PROXY", ("proxy",)),
         ("BROWSER", ("browser", "screenshot", "camoufox")),
         ("LAND", ("landing",)),
-        ("AUTH", ("authorize", "auth0", "signup", "login", "sign in", "session", "oauth", "pkce", "token", "snarf")),
+        ("AUTH", ("authorize", "auth0", "signup", "login", "sign in", "session", "oauth", "pkce", "token", "snarf", "recovery")),
         ("CAPTCHA", ("captcha", "turnstile")),
         ("CLAIM", ("referral", "claim", "gift")),
         ("ONBOARD", ("onboard", "workspace", "phase1")),
         ("KEY", ("api key", "api-key", "apikey")),
         ("SAVE", ("save", "credentials")),
-        ("FAIL", ("fail", "error", "timeout", "blocked", "denied")),
+        # Terminal-ish phrases only (not mid-flow TimeoutError / access_denied)
+        ("FAIL", ("failed after", "account timeout", "otp timeout", "could not ", " expected ")),
     )
     for name, keys in rules:
         if any(k in low for k in keys):
@@ -2424,7 +2432,8 @@ async def goto_with_retry(
             return
         except Exception as e:
             last = e
-            alog(attempt, f"{label} fail {type(e).__name__}")
+            # "miss" not "fail" — avoid HUD FAIL label; retries continue
+            alog(attempt, f"{label} miss {type(e).__name__}")
             navish = _is_nav_timeout(e) or "blank" in str(e).lower()
             if not navish and try_i >= retries:
                 break
@@ -3314,7 +3323,8 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
             break
         u = page.url
         if "risk_control_blocked" in u or "error=access_denied" in u or "error_description=" in u:
-            alog(attempt, f"risk/access error on redirect: {u[:160]}")
+            # Intermediate Auth0 block → recovery Sign-in snarf (not terminal FAIL)
+            alog(attempt, f"risk block on redirect (will recover): {u[:140]}")
             auth_code["code"] = None  # never exchange error redirects
             break
         await asyncio.sleep(0.35)
@@ -3332,7 +3342,7 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
             alog(attempt, f"tokens ok via our PKCE (expires_in={tokens.get('expires_in')})")
             return tokens
         except Exception as e:
-            alog(attempt, f"our PKCE exchange failed: {e} - trying Sign in snarf")
+            alog(attempt, f"our PKCE exchange miss: {e} - trying Sign in snarf")
 
     # Recovery: risk_control_blocked after signup is normal here.
     # Click Sign in -> SPA OAuth -> snarf /oauth/token (same as manual dashboard).
