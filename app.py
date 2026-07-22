@@ -21,14 +21,24 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Log, Static
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Log,
+    Static,
+    TextArea,
+)
 
 # Farm log contract: [HH:MM:SS] [id] step  …
 _RE_HUD_TS_STEP = re.compile(
     r"^\[(?P<ts>\d{1,2}:\d{2}:\d{2})\]\s+\[(?P<id>\d+)\]\s+(?P<step>\S+)"
 )
 _RE_HUD_BARE_OK_FAIL = re.compile(r"^\[(?P<id>\d+)\]\s+(?P<step>OK|FAIL)\b", re.I)
-# Terminal outcomes only in HUD (detail stays in farms/*/results/*/farm.log)
+# HUD steps: outcomes + key farm milestones (not every google fill retry)
 _HUD_SHOW_STEPS = frozenset(
     {
         "start",
@@ -41,17 +51,26 @@ _HUD_SHOW_STEPS = frozenset(
         "error",
         "err",
         "timeout",
+        # getunikey / shared milestones
+        "nav",
+        "oauth",
+        "google",
+        "user",
+        "token",
+        "smoke",
+        "usage",
+        "shot",
     }
 )
 
 
 def hud_show_line(msg: str) -> bool:
-    """Quiet HUD: hub + START/OK/FAIL + important WARP. Full log is on disk."""
+    """HUD: hub + milestones + OK/FAIL + WARP. Skip noisy retries."""
     raw = (msg or "").rstrip("\n")
     if not raw.strip():
         return False
     low = raw.lower()
-    if low.startswith(("[hub]", "[jobctl]", "[error]")):
+    if low.startswith(("[hub]", "[jobctl]", "[error]", "[getunikey]")):
         return True
     if "warp every_n" in low or "warp wave" in low:
         return True
@@ -59,9 +78,30 @@ def hud_show_line(msg: str) -> bool:
         return True
     if low.startswith("[done]") or "exit=" in low and low.startswith("[hub]"):
         return True
+    # Skip noisy mid-step spam
+    if "fill retry" in low or "still on google interstitial" in low:
+        return False
     m = _RE_HUD_TS_STEP.match(raw.strip())
     if m:
-        return m.group("step").lower() in _HUD_SHOW_STEPS
+        step = m.group("step").lower()
+        if step not in _HUD_SHOW_STEPS:
+            return False
+        # google: only milestones, not every "waiting …"
+        if step == "google":
+            rest = raw.lower()
+            return any(
+                x in rest
+                for x in (
+                    "email filled",
+                    "password filled",
+                    "consent",
+                    "post-password",
+                    "page https",
+                    "2fa",
+                    "switched",
+                )
+            )
+        return True
     if _RE_HUD_BARE_OK_FAIL.match(raw.strip()):
         return True
     # Keep short hub tips / list_jobs lines (indented ok/MISSING)
@@ -110,7 +150,7 @@ class HubApp(App[None]):
     }
     #form {
         height: auto;
-        max-height: 16;
+        max-height: 22;
         border: solid $accent;
         padding: 0 1;
         margin: 0 0 1 0;
@@ -118,12 +158,18 @@ class HubApp(App[None]):
     #form .row { height: 3; margin-top: 0; }
     #form Label { width: auto; color: $text-muted; padding: 0 1 0 0; }
     #form Input { width: 1fr; }
+    #form TextArea { width: 1fr; height: 6; }
     #form Checkbox { width: auto; margin-right: 2; }
     #email-row { height: 3; }
     #email-row.hidden { display: none; }
     #email-row Button { min-width: 12; margin-right: 1; }
     #gift-row { height: 3; }
     #gift-row.hidden { display: none; }
+    #getunikey-row { height: auto; min-height: 3; }
+    #getunikey-row.hidden { display: none; }
+    #getunikey-gmail-row { height: 7; }
+    #getunikey-gmail-row.hidden { display: none; }
+    #count-label.dim { color: $text-muted; }
     #btn-job-cycle { min-width: 5; margin: 0 1 0 0; }
     #progress {
         height: auto;
@@ -187,9 +233,13 @@ class HubApp(App[None]):
             with Vertical(id="form"):
                 with Horizontal(classes="row"):
                     yield Label("Job")
-                    yield Input(value="grok", id="job", placeholder="grok|enter|outlook")
+                    yield Input(
+                        value="grok",
+                        id="job",
+                        placeholder="grok|enter|outlook|getunikey",
+                    )
                     yield Button("↻", id="btn-job-cycle", variant="primary")
-                    yield Label("  -n")
+                    yield Label("  -n", id="count-label")
                     yield Input(value="20", id="count", placeholder="20")
                     yield Label("  -c")
                     yield Input(value="3", id="concurrent", placeholder="3")
@@ -217,6 +267,23 @@ class HubApp(App[None]):
                         id="gift-code",
                         placeholder="ENTER_GIFT_CODE (referral)",
                     )
+                # GetUniKey: referral start URL + Google account list
+                with Horizontal(id="getunikey-row", classes="row"):
+                    yield Label("RefURL")
+                    yield Input(
+                        value="",
+                        id="getunikey-referral",
+                        placeholder="https://www.getunikey.ai/sign-up?aff=bTOY (empty=default)",
+                    )
+                with Horizontal(id="getunikey-gmail-row", classes="row"):
+                    yield Label("Gmail")
+                    yield TextArea(
+                        id="getunikey-gmails",
+                        placeholder=(
+                            "email|password  (one per line)\n"
+                            "lanjar4@mangtoha.com|bintang088"
+                        ),
+                    )
             yield ProgressPanel("Progress: idle — set -n then Run", id="progress")
             with Horizontal(id="actions"):
                 yield Button("Run [R]", id="btn-run", variant="success")
@@ -241,17 +308,23 @@ class HubApp(App[None]):
         self._log(f"Hub ready. Jobs: {jobs}")
         self._log("everyN LIVE sync: ubah -c → everyN ikut (kalau everyN≠0). 0=off.")
         self._log("Run = auto WARP connect · everyN>0 = mid-batch rotate · Rotate = manual IP")
-        self._log("Job ↻ / [J] = cycle · Email IMAP|GPTMail (grok/enter) · Gift row (enter)")
+        self._log(
+            "Job ↻ / [J] = cycle · Email IMAP|GPTMail (grok/enter) · Gift (enter) · "
+            "Gmail list + RefURL (getunikey)"
+        )
         self._log("Log quiet: START/OK/FAIL + hub/WARP only · full detail → farms/*/results/*/farm.log")
         self._log("Scroll up = pause follow · End / Run = resume tail")
         self._seed_modes_from_env()
         self._seed_gift_from_env()
+        self._seed_getunikey_from_env()
 
         self._log("Stop [S]=kill farm · Status/Rotate=manual WARP · Quit=close HUD")
         self._log("Grok Email: klik IMAP (catch-all) atau GPTMail (temp API) — hanya job grok.")
+        self._log("getunikey: paste Gmail list email|pass · n=pool size · RefURL optional")
         self._sync_every_n_ui(silent=True)
         self._sync_email_row()
         self._sync_gift_row()
+        self._sync_getunikey_rows()
         self._paint_progress()
         self._warp_worker("status", quiet=True)
 
@@ -341,6 +414,67 @@ class HubApp(App[None]):
             return
         row.set_class(self._job_id() != "enter", "hidden")
 
+    def _seed_getunikey_from_env(self) -> None:
+        """Seed referral URL from hub .env if present."""
+        try:
+            from core.env import load_hub_env
+
+            hub = load_hub_env()
+            ref = (hub.get("GETUNIKEY_REFERRAL_URL") or "").strip()
+        except Exception:
+            ref = ""
+        try:
+            inp = self.query_one("#getunikey-referral", Input)
+            if ref and not inp.value.strip():
+                inp.value = ref
+        except Exception:
+            pass
+
+    def _sync_getunikey_rows(self) -> None:
+        """Show Gmail list + referral URL for getunikey; hide -n (pool-sized)."""
+        is_guk = self._job_id() in ("getunikey", "getunikey-farm")
+        for rid in ("#getunikey-row", "#getunikey-gmail-row"):
+            try:
+                self.query_one(rid, Horizontal).set_class(not is_guk, "hidden")
+            except Exception:
+                pass
+        try:
+            count_inp = self.query_one("#count", Input)
+            count_lbl = self.query_one("#count-label", Label)
+            count_inp.disabled = is_guk
+            count_lbl.set_class(is_guk, "dim")
+            if is_guk:
+                count_inp.placeholder = "pool"
+                count_inp.value = "0"
+            else:
+                count_inp.placeholder = "20"
+                if (count_inp.value or "").strip() in ("0", ""):
+                    count_inp.value = "20"
+        except Exception:
+            pass
+
+    def _parse_getunikey_gmail_list(self) -> list[str]:
+        """Normalize HUD Gmail lines to email|password (accept : too)."""
+        try:
+            raw = self.query_one("#getunikey-gmails", TextArea).text
+        except Exception:
+            return []
+        lines: list[str] = []
+        for ln in (raw or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            if "|" in s:
+                email, _, password = s.partition("|")
+            elif ":" in s:
+                email, _, password = s.partition(":")
+            else:
+                continue
+            email, password = email.strip(), password.strip()
+            if email and password:
+                lines.append(f"{email}|{password}")
+        return lines
+
     def _paint_email_buttons(self) -> None:
         mode = self._email_mode_for()
         try:
@@ -355,6 +489,7 @@ class HubApp(App[None]):
     def on_job_changed(self, _event: Input.Changed) -> None:
         self._sync_email_row()
         self._sync_gift_row()
+        self._sync_getunikey_rows()
 
     @on(Button.Pressed, "#btn-job-cycle")
     def on_job_cycle_btn(self) -> None:
@@ -377,6 +512,7 @@ class HubApp(App[None]):
             return
         self._sync_email_row()
         self._sync_gift_row()
+        self._sync_getunikey_rows()
         self._status(f"Job → {nxt}")
         self._log(f"[hub] job cycle → {nxt}")
 
@@ -521,18 +657,27 @@ class HubApp(App[None]):
             self._log_follow = True
 
     def _read_form(self) -> tuple[str, list[str], bool, int, int, int, str | None]:
-        """Returns job, args, dry, n, c, every_n, policy_note."""
+        """Returns job, args, dry, n, c, every_n, policy_note.
+
+        getunikey: n = Gmail list size (pool); -n 0 means entire pool in farm.
+        """
         from core.warp_policy import normalize_every_n
 
         job = self.query_one("#job", Input).value.strip() or "grok"
-        try:
-            n = max(1, int(self.query_one("#count", Input).value.strip() or "1"))
-        except ValueError:
-            n = 1
+        jlow = job.lower()
+        is_guk = jlow in ("getunikey", "getunikey-farm")
         try:
             c = max(1, int(self.query_one("#concurrent", Input).value.strip() or "1"))
         except ValueError:
             c = 1
+        if is_guk:
+            gmails = self._parse_getunikey_gmail_list()
+            n = max(1, len(gmails)) if gmails else 0
+        else:
+            try:
+                n = max(1, int(self.query_one("#count", Input).value.strip() or "1"))
+            except ValueError:
+                n = 1
         try:
             every_raw = max(0, int(self.query_one("#every-n", Input).value.strip() or "0"))
         except ValueError:
@@ -552,7 +697,11 @@ class HubApp(App[None]):
             extra = extra_raw.split()
         if "-y" not in extra and "--yes" not in extra:
             extra = ["-y", *extra]
-        args = ["-n", str(n), "-c", str(c), *extra]
+        if is_guk:
+            # 0 = farm runs entire unused pool (size from GETUNIKEY_ACCOUNTS_LIST)
+            args = ["-n", "0", "-c", str(c), *extra]
+        else:
+            args = ["-n", str(n), "-c", str(c), *extra]
         dry = bool(self.query_one("#chk-dry", Checkbox).value)
         return job, args, dry, n, c, every_n, note
 
@@ -626,6 +775,29 @@ class HubApp(App[None]):
             self._log(f"  Tip: known jobs: {known}")
             self._status("Unknown job")
             return
+        jlow = job.lower()
+        env_overrides: dict[str, str] = {}
+        if jlow in ("getunikey", "getunikey-farm"):
+            gmails = self._parse_getunikey_gmail_list()
+            if not gmails:
+                self._log("[hub] ERROR: Gmail list empty — paste email|password lines")
+                self._status("getunikey: Gmail list required")
+                return
+            n = len(gmails)
+            env_overrides["GETUNIKEY_ACCOUNTS_LIST"] = "\n".join(gmails)
+            self._log(f"[hub] getunikey Gmail list: {n} account(s) → pool")
+            try:
+                ref = self.query_one("#getunikey-referral", Input).value.strip()
+            except Exception:
+                ref = ""
+            if ref:
+                env_overrides["GETUNIKEY_REFERRAL_URL"] = ref
+                self._log(f"[hub] GETUNIKEY_REFERRAL_URL={ref[:72]}")
+            else:
+                self._log(
+                    "[hub] referral empty — farm default "
+                    "https://www.getunikey.ai/sign-up?aff=bTOY"
+                )
         # Jobs with warp_enabled=False (outlook): ignore form everyN / no auto-connect
         warp_ok = bool(getattr(jdef, "warp_enabled", True))
         if not warp_ok:
@@ -637,7 +809,7 @@ class HubApp(App[None]):
             every_n = 0
             policy_note = ""
         self._busy = True
-        self._reset_progress(0 if dry else n)
+        self._reset_progress(0 if dry else max(n, 1))
         if policy_note:
             self._log(f"[hub] WARP policy: {policy_note}")
         self._status(
@@ -646,8 +818,6 @@ class HubApp(App[None]):
             + ("" if warp_ok else " WARP=off")
             + (" dry" if dry else "")
         )
-        env_overrides: dict[str, str] = {}
-        jlow = job.lower()
         if jlow in self._EMAIL_TOGGLE_JOBS:
             mode = self._email_mode_for(jlow)
             if jlow == "grok":
