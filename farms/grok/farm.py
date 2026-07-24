@@ -3,7 +3,7 @@
 Standalone Grok / xAI account farmer (CLI-only).
 
 Flow per account:
-  1. Generate email (catch-all / plus_trick IMAP, OR gptmail API)
+  1. Generate email (catch-all / plus_trick IMAP, gptmail API, OR exzork API)
   2. Camoufox browser → accounts.x.ai/sign-up
   3. Email → OTP (IMAP or GPTMail API) → Confirm
   4. Name + password + Turnstile → Complete sign up
@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from email import message_from_bytes
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, unquote
+from urllib.parse import parse_qs, quote, urlencode, urlparse, unquote
 
 # Load .env from script directory.
 # setdefault only — hub runner injects GROK_* from global Automation/.env first.
@@ -74,14 +74,20 @@ IMAP_HOST = _env("GROK_IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(_env("GROK_IMAP_PORT", "993") or "993")
 EMAIL_DOMAIN = _env("GROK_EMAIL_DOMAIN").lstrip("@")
 EMAIL_MODE = _env("GROK_EMAIL_MODE", "domain").lower()
-# domain | plus_trick | gptmail (mail.chatgpt.org.uk — no IMAP)
-if EMAIL_MODE not in ("plus_trick", "domain", "gptmail"):
+# domain | plus_trick | gptmail | exzork (mailer.exzork.me REST — no IMAP)
+if EMAIL_MODE not in ("plus_trick", "domain", "gptmail", "exzork"):
     EMAIL_MODE = "domain"
 GMAIL_BASE = _env("GROK_GMAIL_BASE").lower() or IMAP_USER.lower()
 # GPTMail (optional temp-mail provider; OTP via API)
 GPTMAIL_API = _env("GROK_GPTMAIL_API", "https://mail.chatgpt.org.uk").rstrip("/")
 GPTMAIL_DOMAIN = _env("GROK_GPTMAIL_DOMAIN").lstrip("@").lower()  # optional pin
 GPTMAIL_PREFIX = _env("GROK_GPTMAIL_PREFIX").lower()  # optional local prefix
+# Exzork temp-mail (custom domain + optional wildcard subdomain rotate)
+EXZORK_API = _env("GROK_EXZORK_API", "https://mailer.exzork.me").rstrip("/")
+EXZORK_API_KEY = _env("GROK_EXZORK_API_KEY")
+_exzork_dom_raw = _env("GROK_EXZORK_DOMAIN") or EMAIL_DOMAIN
+EXZORK_DOMAIN = _exzork_dom_raw.lstrip("@").lstrip("*.").lower()
+EXZORK_WILDCARD = _env_bool("GROK_EXZORK_WILDCARD", True)
 ACCOUNT_PASSWORD = _env("GROK_PASSWORD", "$Priyo000")
 MAX_ACCOUNTS = int(_env("GROK_MAX_ACCOUNTS", "5") or "5")
 CONCURRENT = int(_env("GROK_CONCURRENT", "1") or "1")
@@ -170,6 +176,8 @@ XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 XAI_AUTHORIZE = "https://auth.x.ai/oauth2/authorize"
 XAI_TOKEN = "https://auth.x.ai/oauth2/token"
 XAI_DEVICE_CODE = "https://auth.x.ai/oauth2/device/code"
+XAI_DEVICE_VERIFY = "https://auth.x.ai/oauth2/device/verify"
+XAI_DEVICE_APPROVE = "https://auth.x.ai/oauth2/device/approve"
 XAI_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 # Device OAuth scope (grok2api default). PKCE consent currently returns Access denied.
 XAI_SCOPE = (
@@ -760,7 +768,17 @@ def init_batch(max_accounts: int, concurrent: int) -> str:
         "batch_id": BATCH_ID,
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "email_mode": EMAIL_MODE,
-        "email_domain": (EMAIL_DOMAIN if EMAIL_MODE == "domain" else (GPTMAIL_DOMAIN or "auto") if EMAIL_MODE == "gptmail" else None),
+        "email_domain": (
+            EMAIL_DOMAIN
+            if EMAIL_MODE == "domain"
+            else (GPTMAIL_DOMAIN or "auto")
+            if EMAIL_MODE == "gptmail"
+            else (
+                f"{'*' if EXZORK_WILDCARD else ''}{EXZORK_DOMAIN}"
+                if EMAIL_MODE == "exzork"
+                else None
+            )
+        ),
         "max_accounts": max_accounts,
         "concurrent": concurrent,
         "email_local_len": EMAIL_LOCAL_LEN,
@@ -772,7 +790,7 @@ def init_batch(max_accounts: int, concurrent: int) -> str:
 
 
 async def generate_email(worker_slot: int | None = None) -> str:
-    """Unique email; domain/plus_trick local, gptmail via API claim.
+    """Unique email; domain/plus_trick local, gptmail/exzork via API claim.
 
     worker_slot: concurrent slot for gptmail sticky domain only.
     """
@@ -783,6 +801,15 @@ async def generate_email(worker_slot: int | None = None) -> str:
                 addr = await loop.run_in_executor(
                     None, lambda: create_gptmail_inbox(worker_slot)
                 )
+                key = addr.lower()
+                if key not in _used_emails:
+                    _used_emails.add(key)
+                    _persist_used_email(key)
+                    return addr
+                continue
+            if EMAIL_MODE == "exzork":
+                loop = asyncio.get_event_loop()
+                addr = await loop.run_in_executor(None, create_exzork_inbox)
                 key = addr.lower()
                 if key not in _used_emails:
                     _used_emails.add(key)
@@ -1804,16 +1831,91 @@ def _tokens_from_oauth_json(data: dict, email_fallback: str = "", auth_mode: str
 
 
 def start_device_authorization() -> dict:
-    """xAI Device OAuth — same as grok2api (works when PKCE consent Access denied)."""
-    return _oauth_post_form(
-        XAI_DEVICE_CODE,
-        {"client_id": XAI_CLIENT_ID, "scope": XAI_SCOPE},
-    )
+    """xAI Device OAuth — same as grok2api / pi / opencode."""
+    form = {"client_id": XAI_CLIENT_ID, "scope": XAI_SCOPE}
+    # pi client sends referrer; some xAI builds expect a non-empty app tag
+    ref = _env("GROK_OAUTH_REFERRER", "grok-cli")
+    if ref:
+        form["referrer"] = ref
+    return _oauth_post_form(XAI_DEVICE_CODE, form)
 
 
-def poll_device_code(device_code: str, interval_s: float = 5.0, timeout_s: float = 180.0) -> dict:
+def _cookie_header_from_playwright(cookies: list[dict]) -> str:
+    """Build Cookie header for auth.x.ai + accounts.x.ai."""
+    parts: list[str] = []
+    for c in cookies or []:
+        name = c.get("name") or ""
+        val = c.get("value")
+        if not name or val is None:
+            continue
+        dom = (c.get("domain") or "").lower().lstrip(".")
+        # device approve needs SSO session cookies
+        if dom.endswith("x.ai") or "x.ai" in dom:
+            parts.append(f"{name}={val}")
+    # de-dupe keep last
+    seen: dict[str, str] = {}
+    for p in parts:
+        k, _, v = p.partition("=")
+        seen[k] = v
+    return "; ".join(f"{k}={v}" for k, v in seen.items())
+
+
+def device_verify_and_approve_http(user_code: str, cookie_header: str) -> tuple[bool, str]:
+    """POST device/verify + device/approve (grok2api SSO path). Returns (ok, detail)."""
+    if not user_code or not cookie_header:
+        return False, "missing user_code or cookies"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/json,*/*",
+        "User-Agent": "grok-farm/device-oauth",
+        "Cookie": cookie_header,
+        "Origin": "https://accounts.x.ai",
+        "Referer": "https://accounts.x.ai/",
+    }
+    detail_parts: list[str] = []
+    for url, form in (
+        (XAI_DEVICE_VERIFY, {"user_code": user_code}),
+        (
+            XAI_DEVICE_APPROVE,
+            {
+                "user_code": user_code,
+                "action": "allow",
+                "principal_type": "User",
+                "principal_id": "",
+            },
+        ),
+    ):
+        body = urlencode(form).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                final = resp.geturl()
+                raw = resp.read(512).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            status = e.code
+            final = e.geturl() if hasattr(e, "geturl") else url
+            raw = e.read(512).decode("utf-8", "replace")
+        except Exception as e:
+            return False, f"{url} err={e}"
+        detail_parts.append(f"{url.split('/')[-1]}:{status}:{final[-60:]}")
+        if status >= 400:
+            return False, f"{url} HTTP {status} {raw[:120]}"
+    return True, " | ".join(detail_parts)
+
+
+def poll_device_code(
+    device_code: str,
+    interval_s: float = 5.0,
+    timeout_s: float = 180.0,
+    *,
+    wait_before_first: bool = True,
+) -> dict:
+    """RFC 8628 device-code poll. Wait one interval before first poll (pi/opencode)."""
     deadline = time.monotonic() + timeout_s
     sleep_s = max(3.0, float(interval_s or 5))
+    if wait_before_first:
+        time.sleep(sleep_s)
     while time.monotonic() < deadline:
         body = urlencode(
             {
@@ -1828,6 +1930,7 @@ def poll_device_code(device_code: str, interval_s: float = 5.0, timeout_s: float
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                "User-Agent": "grok-farm/device-oauth",
             },
             method="POST",
         )
@@ -1847,11 +1950,13 @@ def poll_device_code(device_code: str, interval_s: float = 5.0, timeout_s: float
             time.sleep(sleep_s)
             continue
         if err == "slow_down":
-            sleep_s = min(30.0, sleep_s + 2.0)
+            sleep_s = min(30.0, sleep_s + 5.0)
             time.sleep(sleep_s)
             continue
         if err in ("access_denied", "expired_token", "invalid_grant"):
             raise RuntimeError(f"device poll denied: {data}")
+        # unknown error — brief backoff then continue until timeout
+        print(f"[oauth] device poll unexpected: {data}", flush=True)
         time.sleep(sleep_s)
     raise TimeoutError("device code poll timed out")
 
@@ -2533,6 +2638,192 @@ def read_otp_from_gptmail_sync(target_email: str, timeout: int = 180, since_ts: 
     return None
 
 
+# ── Exzork helpers (EMAIL_MODE=exzork — mailer.exzork.me) ────────────────────
+
+_exzork_lock = threading.Lock()
+_exzork_known: set[str] = set()
+
+
+def _exzork_headers() -> dict[str, str]:
+    if not EXZORK_API_KEY:
+        raise RuntimeError("GROK_EXZORK_API_KEY required for exzork mode")
+    return {
+        "Accept": "application/json",
+        "User-Agent": "grok-farm/exzork",
+        "X-API-Key": EXZORK_API_KEY,
+    }
+
+
+def _exzork_host() -> str:
+    """Apex or random subdomain host for mailbox create."""
+    base = (EXZORK_DOMAIN or "").strip().lower().lstrip("@").lstrip("*.")
+    if not base:
+        raise RuntimeError("GROK_EXZORK_DOMAIN or GROK_EMAIL_DOMAIN required for exzork mode")
+    if not EXZORK_WILDCARD:
+        return base
+    # random subdomain under claimed *.base (anti-block rotate)
+    sub = _crypto_local_part(max(6, min(10, EMAIL_LOCAL_LEN // 2)))
+    return f"{sub}.{base}"
+
+
+def create_exzork_inbox() -> str:
+    """POST /api/v1/mailboxes — random local on apex or rotating subdomain."""
+    last_err = ""
+    for attempt in range(8):
+        host = _exzork_host()
+        try:
+            data = _http_json(
+                f"{EXZORK_API}/api/v1/mailboxes",
+                {"random": True, "domain": host},
+                headers=_exzork_headers(),
+            )
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            last_err = f"HTTP {e.code}: {body[:160]}"
+            if e.code in (400, 409, 422, 429):
+                time.sleep(0.3 + attempt * 0.15)
+                continue
+            raise RuntimeError(f"exzork mailbox {last_err}") from e
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.4)
+            continue
+        mb = {}
+        if isinstance(data, dict):
+            mb = data.get("mailbox") or {}
+            if not mb and data.get("mailboxes"):
+                mbs = data["mailboxes"]
+                if isinstance(mbs, list) and mbs:
+                    mb = mbs[0] if isinstance(mbs[0], dict) else {}
+        addr = (mb.get("address") if isinstance(mb, dict) else "") or ""
+        addr = str(addr).strip().lower()
+        if not addr or "@" not in addr:
+            last_err = f"no address in {str(data)[:200]}"
+            time.sleep(0.3)
+            continue
+        with _exzork_lock:
+            _exzork_known.add(addr)
+        print(f"[EXZORK] claimed {addr}", flush=True)
+        return addr
+    raise RuntimeError(f"exzork: could not create mailbox after retries ({last_err})")
+
+
+def _exzork_msg_blob(item: dict) -> tuple[str, str, str]:
+    """subject, body_text, from for one Exzork message dict."""
+    subject = str(item.get("subject") or "")
+    fr = str(
+        item.get("from")
+        or item.get("from_address")
+        or item.get("sender")
+        or ""
+    )
+    text = str(item.get("text") or item.get("body") or item.get("content") or "")
+    html = str(item.get("html") or item.get("html_content") or item.get("body_html") or "")
+    # nested body object
+    body_obj = item.get("body")
+    if isinstance(body_obj, dict):
+        text = text or str(body_obj.get("text") or "")
+        html = html or str(body_obj.get("html") or "")
+    body = text + "\n" + _strip_html(html)
+    return subject, body, fr
+
+
+def read_otp_from_exzork_sync(
+    target_email: str, timeout: int = 180, since_ts: float | None = None
+) -> str | None:
+    """Poll Exzork GET /mailboxes/{address}/messages for xAI XXX-XXX code."""
+    addr = target_email.lower().strip()
+    print(f"[EXZORK] Waiting OTP -> {addr} (timeout={timeout}s)...", flush=True)
+    start = time.time()
+    since_ts = since_ts or (start - 30)
+    seen_ids: set[str] = set()
+    polls = 0
+    enc = quote(addr, safe="")
+    while time.time() - start < timeout:
+        polls += 1
+        elapsed = int(time.time() - start)
+        try:
+            data = _http_json(
+                f"{EXZORK_API}/api/v1/mailboxes/{enc}/messages",
+                headers=_exzork_headers(),
+            )
+            items: list = []
+            if isinstance(data, dict):
+                items = data.get("messages") or data.get("items") or []
+            elif isinstance(data, list):
+                items = data
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("id") or "")
+                if mid and mid in seen_ids:
+                    continue
+                if mid:
+                    seen_ids.add(mid)
+                # optional created_at filter
+                created = item.get("created_at") or item.get("received_at") or item.get("date")
+                if created and since_ts:
+                    try:
+                        if isinstance(created, (int, float)):
+                            ts_f = float(created)
+                            if ts_f > 1e12:
+                                ts_f /= 1000.0
+                        else:
+                            # ISO-ish
+                            s = str(created).replace("Z", "+00:00")
+                            ts_f = datetime.fromisoformat(s).timestamp()
+                        if ts_f and ts_f < since_ts - 5:
+                            continue
+                    except Exception:
+                        pass
+                subject, body, fr = _exzork_msg_blob(item)
+                code = _extract_xai_code(subject, body)
+                if not code and mid:
+                    try:
+                        full = _http_json(
+                            f"{EXZORK_API}/api/v1/messages/{mid}",
+                            headers=_exzork_headers(),
+                        )
+                        d = full
+                        if isinstance(full, dict):
+                            d = full.get("message") or full.get("data") or full
+                        if isinstance(d, dict):
+                            subject, body, fr = _exzork_msg_blob(d)
+                            code = _extract_xai_code(subject, body)
+                    except Exception as e_det:
+                        if polls % 4 == 0:
+                            print(f"[EXZORK] detail fail: {e_det}", flush=True)
+                if not code:
+                    continue
+                blob = f"{subject} {fr} {body}".lower()
+                if "xai" not in blob and "grok" not in blob and "confirmation" not in blob:
+                    if "code" not in blob and "verify" not in blob:
+                        continue
+                with _claimed_otps_lock:
+                    if code in _claimed_otps_sync:
+                        continue
+                    _claimed_otps_sync.add(code)
+                print(
+                    f"[EXZORK] OTP found: {code} for {addr} "
+                    f"(subj={subject[:60]!r} from={fr[:40]!r} t+{elapsed}s)",
+                    flush=True,
+                )
+                return code
+            if polls == 1 or polls % 5 == 0:
+                print(
+                    f"[EXZORK] still waiting… {elapsed}s/{timeout}s msgs={len(items)}",
+                    flush=True,
+                )
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            print(f"[EXZORK] HTTP {e.code}: {body[:120]}", flush=True)
+        except Exception as e:
+            print(f"[EXZORK] poll error: {e}", flush=True)
+        time.sleep(3)
+    print(f"[EXZORK] Timeout after {timeout}s for {addr}", flush=True)
+    return None
+
+
 async def _page_error_text(page) -> str:
     """Best-effort page text including red/error nodes (xAI React banners)."""
     try:
@@ -2637,6 +2928,8 @@ async def wait_otp_imap_keepalive(
     loop = asyncio.get_event_loop()
     if EMAIL_MODE == "gptmail":
         poll_fn = lambda: read_otp_from_gptmail_sync(email_addr, timeout_s, since_ts)
+    elif EMAIL_MODE == "exzork":
+        poll_fn = lambda: read_otp_from_exzork_sync(email_addr, timeout_s, since_ts)
     else:
         poll_fn = lambda: read_otp_from_imap_sync(email_addr, timeout_s, since_ts)
     fut = loop.run_in_executor(None, poll_fn)
@@ -2766,7 +3059,19 @@ async def do_signup(page, email_addr: str, password: str, attempt: int) -> bool:
             raise RuntimeError(f"domain_not_allowed: {reason}")
         raise RuntimeError("OTP input never appeared after Sign up")
 
-    emit_progress(attempt, "wait_otp", f"Waiting for xAI confirmation code via {'GPTMAIL' if EMAIL_MODE == 'gptmail' else 'IMAP'}", email_addr)
+        _otp_via = (
+            "GPTMAIL"
+            if EMAIL_MODE == "gptmail"
+            else "EXZORK"
+            if EMAIL_MODE == "exzork"
+            else "IMAP"
+        )
+        emit_progress(
+            attempt,
+            "wait_otp",
+            f"Waiting for xAI confirmation code via {_otp_via}",
+            email_addr,
+        )
     otp = await wait_otp_imap_keepalive(
         page, email_addr, OTP_TIMEOUT_S, otp_wait_started - 15, attempt
     )
@@ -3331,89 +3636,154 @@ async def obtain_oidc_tokens(page, email_addr: str, password: str, attempt: int)
             await click_login_with_email(page)
             await drive_email_password_login(page, email_addr, password, attempt)
 
-    try:
-        dev = await asyncio.to_thread(start_device_authorization)
-    except Exception as e:
-        raise RuntimeError(f"device/code failed: {e}") from e
+    last_err: Exception | None = None
+    for oauth_try in range(1, 3):  # 1 hard retry on invalid_grant after UI success
+        poll_task: asyncio.Task | None = None
+        try:
+            try:
+                dev = await asyncio.to_thread(start_device_authorization)
+            except Exception as e:
+                raise RuntimeError(f"device/code failed: {e}") from e
 
-    device_code = dev.get("device_code") or ""
-    user_code = dev.get("user_code") or ""
-    verify = dev.get("verification_uri_complete") or (
-        f"{dev.get('verification_uri', 'https://accounts.x.ai/oauth2/device')}?user_code={user_code}"
-    )
-    interval = float(dev.get("interval") or 5)
-    if not device_code:
-        raise RuntimeError(f"device/code missing device_code: {dev}")
+            device_code = dev.get("device_code") or ""
+            user_code = dev.get("user_code") or ""
+            verify = dev.get("verification_uri_complete") or (
+                f"{dev.get('verification_uri', 'https://accounts.x.ai/oauth2/device')}"
+                f"?user_code={user_code}"
+            )
+            interval = float(dev.get("interval") or 5)
+            if not device_code:
+                raise RuntimeError(f"device/code missing device_code: {dev}")
 
-    print(f"[{attempt}] device user_code={user_code}", flush=True)
+            print(
+                f"[{attempt}] device user_code={user_code} try={oauth_try}/2",
+                flush=True,
+            )
 
-    poll_task = asyncio.create_task(
-        asyncio.to_thread(poll_device_code, device_code, interval, 180.0)
-    )
-    try:
-        await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(1.0)
-        await dismiss_cookie_banner(page)
-        await recover_page_load_error(page, attempt)
-        await handle_turnstile(page, attempt, max_wait=12)
-
-        if await page.locator('input[type="email"], input[type="password"]').count() > 0:
-            await click_login_with_email(page)
-            await asyncio.sleep(0.3)
-            await drive_email_password_login(page, email_addr, password, attempt)
-            await asyncio.sleep(0.6)
+            # Navigate + consent FIRST, then poll (avoids early invalid_grant race)
             await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
             await asyncio.sleep(1.0)
+            await dismiss_cookie_banner(page)
+            await recover_page_load_error(page, attempt)
+            await handle_turnstile(page, attempt, max_wait=12)
 
-        for _ in range(10):
-            if poll_task.done():
-                break
-            await handle_turnstile(page, attempt, max_wait=6)
-            body = ""
-            try:
-                body = (await page.inner_text("body"))[:500].lower()
-            except Exception:
-                pass
-            if any(
-                x in body
-                for x in (
-                    "success",
-                    "approved",
-                    "you can close",
-                    "return to",
-                    "device authorized",
-                    "authorization complete",
-                    "already authorized",
+            if await page.locator('input[type="email"], input[type="password"]').count() > 0:
+                await click_login_with_email(page)
+                await asyncio.sleep(0.3)
+                await drive_email_password_login(page, email_addr, password, attempt)
+                await asyncio.sleep(0.6)
+                await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
+                await asyncio.sleep(1.0)
+
+            approved = False
+            for _ in range(12):
+                await handle_turnstile(page, attempt, max_wait=6)
+                body = ""
+                try:
+                    body = (await page.inner_text("body"))[:800].lower()
+                except Exception:
+                    pass
+                if any(
+                    x in body
+                    for x in (
+                        "success",
+                        "approved",
+                        "you can close",
+                        "return to",
+                        "device authorized",
+                        "authorization complete",
+                        "already authorized",
+                    )
+                ):
+                    print(f"[{attempt}] device page looks approved", flush=True)
+                    approved = True
+                    break
+                if "failed to generate" in body or "access denied" in body:
+                    print(
+                        f"[{attempt}] WARN device page text: access denied / failed generate",
+                        flush=True,
+                    )
+                clicked = await click_text_button(
+                    page,
+                    [
+                        "Continue",
+                        "Allow",
+                        "Authorize",
+                        "Approve",
+                        "Confirm",
+                        "Yes",
+                        "Accept",
+                        "Next",
+                    ],
+                    exclude=["Google", "Deny", "Cancel", "Sign out"],
                 )
-            ):
-                print(f"[{attempt}] device page looks approved", flush=True)
-                break
-            if "failed to generate" in body or "access denied" in body:
-                print(f"[{attempt}] WARN device page text: access denied / failed generate", flush=True)
-            clicked = await click_text_button(
-                page,
-                ["Continue", "Allow", "Authorize", "Approve", "Confirm", "Yes", "Accept", "Next"],
-                exclude=["Google", "Deny", "Cancel", "Sign out"],
-            )
-            await asyncio.sleep(1.0 if clicked else 1.2)
+                await asyncio.sleep(1.0 if clicked else 1.2)
 
-        await screenshot(page, attempt, "device_oauth")
-        data = await asyncio.wait_for(poll_task, timeout=200.0)
-    except Exception as e:
-        if not poll_task.done():
-            poll_task.cancel()
+            await screenshot(page, attempt, "device_oauth")
+
+            # Explicit HTTP verify+approve (grok2api) — UI "Device Authorized"
+            # alone often still yields invalid_grant on token poll.
             try:
-                await poll_task
+                cookies = await page.context.cookies()
+            except Exception:
+                cookies = []
+            cookie_hdr = _cookie_header_from_playwright(cookies)
+            if cookie_hdr:
+                ok_http, http_detail = await asyncio.to_thread(
+                    device_verify_and_approve_http, user_code, cookie_hdr
+                )
+                print(
+                    f"[{attempt}] device HTTP approve ok={ok_http} {http_detail}",
+                    flush=True,
+                )
+                if ok_http:
+                    approved = True
+            else:
+                print(f"[{attempt}] WARN no x.ai cookies for HTTP approve", flush=True)
+
+            if approved:
+                await asyncio.sleep(2.0)
+
+            poll_task = asyncio.create_task(
+                asyncio.to_thread(
+                    poll_device_code,
+                    device_code,
+                    interval,
+                    120.0,
+                    wait_before_first=not approved,
+                )
+            )
+            data = await asyncio.wait_for(poll_task, timeout=140.0)
+            emit_progress(
+                attempt, "token_exchange", "Device code exchanged for tokens", email_addr
+            )
+            tokens = _tokens_from_oauth_json(
+                data, email_fallback=email_addr, auth_mode="device_oauth"
+            )
+            if not tokens.get("email"):
+                tokens["email"] = email_addr
+            return tokens
+        except Exception as e:
+            last_err = e
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
+                try:
+                    await poll_task
+                except Exception:
+                    pass
+            low = str(e).lower()
+            retryable = "invalid_grant" in low or "access denied" in low or "device poll denied" in low
+            print(f"[{attempt}] device oauth try={oauth_try} fail: {e}", flush=True)
+            try:
+                await screenshot(page, attempt, f"oauth_no_code_t{oauth_try}")
             except Exception:
                 pass
-        await screenshot(page, attempt, "oauth_no_code")
-        raise RuntimeError(f"Device OAuth failed: {e}") from e
+            if not retryable or oauth_try >= 2:
+                break
+            await asyncio.sleep(1.5)
+            continue
 
-    emit_progress(attempt, "token_exchange", "Device code exchanged for tokens", email_addr)
-    tokens = _tokens_from_oauth_json(data, email_fallback=email_addr, auth_mode="device_oauth")
-    if not tokens.get("email"):
-        tokens["email"] = email_addr
-    return tokens
+    raise RuntimeError(f"Device OAuth failed: {last_err}") from last_err
 
 
 # ── Worker ───────────────────────────────────────────────────────────────────
@@ -3664,13 +4034,60 @@ async def _maybe_warp_after_success(attempt: int) -> None:
 
 _results_lock = asyncio.Lock()
 
+# Lazy VPS batch pusher (same stack as reauth: merge-by-email every N OK)
+_vps_pusher = None
+_vps_pusher_lock = threading.Lock()
+
+
+def _get_vps_pusher():
+    """Create once: GROK_VPS_PUSH=1 (or true) + host/pass from hub .env."""
+    global _vps_pusher
+    with _vps_pusher_lock:
+        if _vps_pusher is not None:
+            return _vps_pusher if _vps_pusher is not False else None
+        raw = (_env("GROK_VPS_PUSH") or "").strip().lower()
+        if raw not in ("1", "true", "yes", "on"):
+            _vps_pusher = False
+            print(
+                "[vps-push] off for farm (set GROK_VPS_PUSH=1 to inject VPS)",
+                flush=True,
+            )
+            return None
+        try:
+            from vps_push import VpsBatchPusher  # same dir as farm.py
+
+            every = max(1, int(_env("GROK_VPS_PUSH_EVERY") or "10"))
+            _vps_pusher = VpsBatchPusher(
+                every=every,
+                log=lambda m: print(m, flush=True),
+                enabled=True,
+            )
+            return _vps_pusher
+        except Exception as e:
+            print(f"[vps-push] init failed: {e}", flush=True)
+            _vps_pusher = False
+            return None
+
+
+def _flush_vps_pusher() -> None:
+    p = _get_vps_pusher()
+    if p is None:
+        return
+    try:
+        p.flush_remaining()
+        print(
+            f"[vps-push] farm summary flushes={p.flushes} pushed={p.pushed} "
+            f"pruned_local={getattr(p, 'pruned', 0)} errors={p.errors}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[vps-push] final flush error: {e}", flush=True)
+
 
 def _inject_to_9router(result: dict) -> None:
     """Inject a farmed account directly into the 9router SQLite DB."""
-    import importlib.util, secrets as _secrets
+    import secrets as _secrets
     DB_PATH = os.path.join(os.environ.get("APPDATA", ""), "9router", "db", "data.sqlite")
-    BSQ3_PATH = os.path.join(os.environ.get("APPDATA", ""), "9router", "runtime",
-                             "node_modules", "better-sqlite3", "lib", "database.js")
     if not os.path.isfile(DB_PATH):
         vlog(f"[9router inject] DB not found at {DB_PATH}, skipping")
         return
@@ -3692,7 +4109,6 @@ def _inject_to_9router(result: dict) -> None:
             conn.close()
             return
 
-        import uuid as _uuid
         row_id = "grok-farm-" + _secrets.token_hex(8)
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         expires_at = tokens.get("expires_at") or now
@@ -3726,9 +4142,24 @@ def _inject_to_9router(result: dict) -> None:
         )
         conn.commit()
         conn.close()
-        print(f"[9router inject] ✓ {email} → DB (id={row_id})", flush=True)
+        print(f"[9router inject] ✓ {email} → local DB (id={row_id})", flush=True)
     except Exception as ex:
         vlog(f"[9router inject] ERROR: {ex}")
+
+
+def _queue_vps_inject(result: dict) -> None:
+    """Queue farmed tokens for VPS merge push (every GROK_VPS_PUSH_EVERY OK)."""
+    tokens = result.get("tokens") or {}
+    email = (result.get("email") or "").strip()
+    if not email or not tokens.get("access_token") or not tokens.get("refresh_token"):
+        return
+    pusher = _get_vps_pusher()
+    if pusher is None:
+        return
+    try:
+        pusher.add(email, tokens)
+    except Exception as e:
+        print(f"[vps-push] queue error for {email}: {e}", flush=True)
 
 
 async def save_result_to_file(result: dict):
@@ -3760,11 +4191,17 @@ async def save_result_to_file(result: dict):
             _used_emails.add(email)
         vlog(f"saved → {RESULTS_JSON.name} + {RESULTS_TXT.name}")
 
-    # Inject into 9router DB (non-blocking, errors don't affect main flow)
+    # Inject into local 9router DB (non-blocking)
     try:
         _inject_to_9router(result)
     except Exception as ex:
         vlog(f"[9router inject] unhandled: {ex}")
+
+    # Merge-push to VPS 9router (batch every N; prune local after success if enabled)
+    try:
+        _queue_vps_inject(result)
+    except Exception as ex:
+        vlog(f"[vps-push] unhandled: {ex}")
 
 
 async def save_failed_to_file(attempt: int, email: str, error: str):
@@ -3833,6 +4270,13 @@ async def main():
     if EMAIL_MODE == "gptmail" and not GPTMAIL_API:
         print("ERROR: set GROK_GPTMAIL_API for gptmail mode", flush=True)
         sys.exit(1)
+    if EMAIL_MODE == "exzork":
+        if not EXZORK_API_KEY:
+            print("ERROR: set GROK_EXZORK_API_KEY for exzork mode", flush=True)
+            sys.exit(1)
+        if not EXZORK_DOMAIN:
+            print("ERROR: set GROK_EXZORK_DOMAIN or GROK_EMAIL_DOMAIN for exzork mode", flush=True)
+            sys.exit(1)
 
     _load_used_emails()
     if EMAIL_MODE == "gptmail":
@@ -3849,6 +4293,14 @@ async def main():
     elif EMAIL_MODE == "plus_trick":
         print(f"  Gmail base : {GMAIL_BASE or IMAP_USER}", flush=True)
         print(f"  IMAP       : {IMAP_USER} @ {IMAP_HOST}:{IMAP_PORT}", flush=True)
+    elif EMAIL_MODE == "exzork":
+        print(f"  Exzork     : {EXZORK_API}", flush=True)
+        print(
+            f"  Domain     : {'*.' if EXZORK_WILDCARD else ''}{EXZORK_DOMAIN} "
+            f"(wildcard={'on' if EXZORK_WILDCARD else 'off'})",
+            flush=True,
+        )
+        print(f"  API key    : {EXZORK_API_KEY[:10]}…", flush=True)
     else:
         print(f"  GPTMail    : {GPTMAIL_API}", flush=True)
         print(f"  Pin domain : {GPTMAIL_DOMAIN or '(auto pool)'}", flush=True)
@@ -3980,6 +4432,11 @@ async def main():
     try:
         workers = [asyncio.create_task(worker()) for _ in range(concurrent)]
         await asyncio.gather(*workers)
+        # Flush remaining VPS inject queue (< every-N leftovers)
+        try:
+            await asyncio.to_thread(_flush_vps_pusher)
+        except Exception as e:
+            print(f"[vps-push] end flush: {e}", flush=True)
     finally:
         tick.cancel()
         try:
