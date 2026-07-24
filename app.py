@@ -219,6 +219,8 @@ class HubApp(App[None]):
 
     # Jobs that support IMAP domain vs GPTMail toggle in HUD
     _EMAIL_TOGGLE_JOBS = frozenset({"grok", "enter"})
+    # Jobs that support inject target Local vs VPS
+    _INJECT_TOGGLE_JOBS = frozenset({"grok", "grok-reauth"})
 
     def __init__(self) -> None:
         super().__init__()
@@ -226,6 +228,8 @@ class HubApp(App[None]):
         self._syncing_form = False  # prevent Input.Changed feedback loop
         # per-job email mode: domain (IMAP) | gptmail — seeded from hub .env on mount
         self._email_mode: dict[str, str] = {"grok": "domain", "enter": "gptmail"}
+        # Inject target for grok / grok-reauth: local | vps (default vps if env push on)
+        self._inject_target: str = "vps"
         # Log follow: pause when user scrolls up; End / Run resumes
         self._log_follow: bool = True
 
@@ -260,7 +264,14 @@ class HubApp(App[None]):
                     yield Label("Email")
                     yield Button("IMAP", id="btn-email-imap", variant="success")
                     yield Button("GPTMail", id="btn-email-gptmail", variant="default")
+                    yield Button("Exzork", id="btn-email-exzork", variant="default")
                     yield Label("  (grok/enter)", id="email-hint")
+                # Inject target: local 9router DB vs VPS merge push (grok + grok-reauth)
+                with Horizontal(id="inject-row", classes="row"):
+                    yield Label("Inject")
+                    yield Button("Local", id="btn-inject-local", variant="success")
+                    yield Button("VPS", id="btn-inject-vps", variant="default")
+                    yield Label("  9router DB", id="inject-hint")
                 # Enter gift code (shown when Job=enter)
                 with Horizontal(id="gift-row", classes="row"):
                     yield Label("Gift")
@@ -311,7 +322,7 @@ class HubApp(App[None]):
         self._log("everyN LIVE sync: ubah -c → everyN ikut (kalau everyN≠0). 0=off.")
         self._log("Run = auto WARP connect · everyN>0 = mid-batch rotate · Rotate = manual IP")
         self._log(
-            "Job ↻ / [J] = cycle · Email IMAP|GPTMail (grok/enter) · Gift (enter) · "
+            "Job ↻ / [J] = cycle · Email IMAP|GPTMail|Exzork (grok) · Gift (enter) · "
             "Gmail list + RefURL (getunikey)"
         )
         self._log("Log quiet: START/OK/FAIL + hub/WARP only · full detail → farms/*/results/*/farm.log")
@@ -319,14 +330,17 @@ class HubApp(App[None]):
         self._seed_modes_from_env()
         self._seed_gift_from_env()
         self._seed_getunikey_from_env()
+        self._seed_inject_from_env()
 
         self._log("Stop [S]=kill farm · Status/Rotate=manual WARP · Quit=close HUD")
-        self._log("Grok Email: klik IMAP (catch-all) atau GPTMail (temp API) — hanya job grok.")
+        self._log("Grok Email: IMAP | GPTMail | Exzork (mailer.exzork.me wildcard).")
+        self._log("Inject Local|VPS (grok / grok-reauth) → 9router DB target")
         self._log("getunikey: paste Gmail list email|pass · n=pool size · RefURL optional")
         self._sync_every_n_ui(silent=True)
         self._sync_email_row()
         self._sync_gift_row()
         self._sync_getunikey_rows()
+        self._sync_inject_row()
         self._paint_progress()
         self._warp_worker("status", quiet=True)
 
@@ -349,15 +363,25 @@ class HubApp(App[None]):
         except Exception:
             hub = {}
         shared = (hub.get("EMAIL_MODE") or "domain").strip().lower()
+        _ok = ("domain", "plus_trick", "gptmail", "exzork")
         for jid, key, default in (
-            ("grok", "GROK_EMAIL_MODE", shared if shared in ("domain", "gptmail") else "domain"),
+            (
+                "grok",
+                "GROK_EMAIL_MODE",
+                shared if shared in ("domain", "gptmail", "exzork") else "domain",
+            ),
             ("enter", "ENTER_EMAIL_MODE", "gptmail"),
         ):
             raw = (hub.get(key) or default or "domain").strip().lower()
-            if raw not in ("domain", "plus_trick", "gptmail"):
-                raw = default if default in ("domain", "gptmail") else "domain"
-            # HUD only toggles domain vs gptmail (plus_trick → IMAP/domain button)
-            self._email_mode[jid] = "gptmail" if raw == "gptmail" else "domain"
+            if raw not in _ok:
+                raw = default if default in ("domain", "gptmail", "exzork") else "domain"
+            # HUD: domain | gptmail | exzork (plus_trick → IMAP/domain button)
+            if raw == "gptmail":
+                self._email_mode[jid] = "gptmail"
+            elif raw == "exzork":
+                self._email_mode[jid] = "exzork"
+            else:
+                self._email_mode[jid] = "domain"
 
     def _seed_gift_from_env(self) -> None:
         try:
@@ -377,22 +401,30 @@ class HubApp(App[None]):
     def _email_mode_for(self, job: str | None = None) -> str:
         jid = (job or self._job_id()).lower()
         mode = self._email_mode.get(jid, "domain")
-        return mode if mode in ("domain", "gptmail") else "domain"
+        return mode if mode in ("domain", "gptmail", "exzork") else "domain"
 
     def _set_email_mode(self, mode: str) -> None:
         jid = self._job_id()
         if jid not in self._EMAIL_TOGGLE_JOBS:
             return
-        if mode not in ("domain", "gptmail"):
+        if mode not in ("domain", "gptmail", "exzork"):
+            return
+        # Exzork is grok-only for now (enter stays gptmail/domain)
+        if mode == "exzork" and jid != "grok":
+            self._status("Exzork: grok only")
             return
         self._email_mode[jid] = mode
         self._paint_email_buttons()
-        label = "GPTMail (API)" if mode == "gptmail" else "IMAP (domain)"
+        label = {
+            "gptmail": "GPTMail (API)",
+            "exzork": "Exzork (API)",
+            "domain": "IMAP (domain)",
+        }.get(mode, mode)
         self._status(f"{jid} email: {label}")
         self._log(f"[hub] {jid} EMAIL_MODE → {mode}")
 
     def _sync_email_row(self) -> None:
-        """Show IMAP/GPTMail toggles for grok + enter."""
+        """Show IMAP/GPTMail/Exzork toggles for grok + enter."""
         try:
             row = self.query_one("#email-row", Horizontal)
             hint = self.query_one("#email-hint", Label)
@@ -401,6 +433,10 @@ class HubApp(App[None]):
         jid = self._job_id()
         show = jid in self._EMAIL_TOGGLE_JOBS
         row.set_class(not show, "hidden")
+        try:
+            self.query_one("#btn-email-exzork", Button).display = jid == "grok"
+        except Exception:
+            pass
         if show:
             try:
                 hint.update(f"  ({jid})")
@@ -488,16 +524,70 @@ class HubApp(App[None]):
         try:
             btn_imap = self.query_one("#btn-email-imap", Button)
             btn_gpt = self.query_one("#btn-email-gptmail", Button)
+            btn_exz = self.query_one("#btn-email-exzork", Button)
             btn_imap.variant = "success" if mode == "domain" else "default"
             btn_gpt.variant = "success" if mode == "gptmail" else "default"
+            btn_exz.variant = "success" if mode == "exzork" else "default"
         except Exception:
             pass
+
+    def _seed_inject_from_env(self) -> None:
+        """Default inject target: VPS if GROK_VPS_PUSH on, else Local."""
+        try:
+            from core.env import load_hub_env
+
+            hub = load_hub_env()
+            raw = (hub.get("GROK_VPS_PUSH") or "").strip().lower()
+            self._inject_target = (
+                "vps" if raw in ("1", "true", "yes", "on") else "local"
+            )
+        except Exception:
+            self._inject_target = "local"
+
+    def _sync_inject_row(self) -> None:
+        """Show Inject Local|VPS only for grok / grok-reauth."""
+        try:
+            row = self.query_one("#inject-row", Horizontal)
+        except Exception:
+            return
+        show = self._job_id() in self._INJECT_TOGGLE_JOBS
+        row.set_class(not show, "hidden")
+        if show:
+            self._paint_inject_buttons()
+
+    def _paint_inject_buttons(self) -> None:
+        t = (self._inject_target or "local").lower()
+        try:
+            btn_l = self.query_one("#btn-inject-local", Button)
+            btn_v = self.query_one("#btn-inject-vps", Button)
+            btn_l.variant = "success" if t == "local" else "default"
+            btn_v.variant = "success" if t == "vps" else "default"
+        except Exception:
+            pass
+
+    def _set_inject_target(self, target: str) -> None:
+        t = (target or "local").strip().lower()
+        if t not in ("local", "vps"):
+            t = "local"
+        self._inject_target = t
+        self._paint_inject_buttons()
+        self._log(f"[hub] Inject → {t.upper()} 9router DB")
+        self._status(f"Inject: {t}")
+
+    @on(Button.Pressed, "#btn-inject-local")
+    def on_inject_local(self) -> None:
+        self._set_inject_target("local")
+
+    @on(Button.Pressed, "#btn-inject-vps")
+    def on_inject_vps(self) -> None:
+        self._set_inject_target("vps")
 
     @on(Input.Changed, "#job")
     def on_job_changed(self, _event: Input.Changed) -> None:
         self._sync_email_row()
         self._sync_gift_row()
         self._sync_getunikey_rows()
+        self._sync_inject_row()
 
     @on(Button.Pressed, "#btn-job-cycle")
     def on_job_cycle_btn(self) -> None:
@@ -521,6 +611,7 @@ class HubApp(App[None]):
         self._sync_email_row()
         self._sync_gift_row()
         self._sync_getunikey_rows()
+        self._sync_inject_row()
         self._status(f"Job → {nxt}")
         self._log(f"[hub] job cycle → {nxt}")
 
@@ -535,6 +626,12 @@ class HubApp(App[None]):
         if self._job_id() not in self._EMAIL_TOGGLE_JOBS:
             return
         self._set_email_mode("gptmail")
+
+    @on(Button.Pressed, "#btn-email-exzork")
+    def on_email_exzork(self) -> None:
+        if self._job_id() not in self._EMAIL_TOGGLE_JOBS:
+            return
+        self._set_email_mode("exzork")
 
     def _parse_int_field(self, field_id: str, default: int = 1) -> int:
         try:
@@ -883,6 +980,16 @@ class HubApp(App[None]):
                 self._log(f"[hub] ENTER_GIFT_CODE set ({gift[:4]}…{gift[-2:] if len(gift) > 6 else ''})")
             else:
                 self._log("[hub] WARN: Gift empty — farm uses ENTER_GIFT_CODE from .env / default")
+        # Grok inject target: Local 9router DB only vs VPS merge push
+        if jlow in self._INJECT_TOGGLE_JOBS:
+            inj = (self._inject_target or "local").lower()
+            if inj == "vps":
+                env_overrides["GROK_VPS_PUSH"] = "1"
+                env_overrides["GROK_INJECT_TARGET"] = "vps"
+            else:
+                env_overrides["GROK_VPS_PUSH"] = "0"
+                env_overrides["GROK_INJECT_TARGET"] = "local"
+            self._log(f"[hub] Inject target={inj} (GROK_VPS_PUSH={env_overrides['GROK_VPS_PUSH']})")
         env_ov: dict[str, str] | None = env_overrides or None
         if not dry:
             if warp_ok:
