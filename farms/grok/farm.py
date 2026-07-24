@@ -7,7 +7,7 @@ Flow per account:
   2. Camoufox browser → accounts.x.ai/sign-up
   3. Email → OTP (IMAP or GPTMail API) → Confirm
   4. Name + password + Turnstile → Complete sign up
-  5. Login if needed → OAuth PKCE (Grok CLI) → tokens
+  5. Login if needed → Device OAuth (Grok CLI / grok2api-style) → tokens
   6. Append result to JSON + TXT (no poolprox DB)
 
 Config: copy .env.example → .env then edit.
@@ -169,8 +169,14 @@ SIGNIN_URL = "https://accounts.x.ai/sign-in"
 XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 XAI_AUTHORIZE = "https://auth.x.ai/oauth2/authorize"
 XAI_TOKEN = "https://auth.x.ai/oauth2/token"
+XAI_DEVICE_CODE = "https://auth.x.ai/oauth2/device/code"
 XAI_REDIRECT_URI = "http://127.0.0.1:56121/callback"
+# Device OAuth scope (grok2api default). PKCE consent currently returns Access denied.
 XAI_SCOPE = (
+    "openid profile email offline_access "
+    "grok-cli:access api:access"
+)
+XAI_SCOPE_LEGACY = (
     "openid profile email offline_access "
     "grok-cli:access api:access conversations:read conversations:write"
 )
@@ -1087,11 +1093,14 @@ async def screenshot(page, attempt: int, tag: str):
 
 
 async def dismiss_cookie_banner(page) -> None:
-    """OneTrust cookie modal blocks clicks — accept/reject early."""
+    """Cookie modal (OneTrust + xAI custom) blocks Next/Login — accept early."""
     for sel in (
         "#onetrust-accept-btn-handler",
         "#onetrust-reject-all-handler",
         "#accept-recommended-btn-handler",
+        'button:has-text("Accept All Cookies")',
+        'button:has-text("Accept All")',
+        'button:has-text("Reject All")',
     ):
         try:
             btn = page.locator(sel).first
@@ -1102,9 +1111,26 @@ async def dismiss_cookie_banner(page) -> None:
         except Exception:
             continue
     try:
-        await click_text_button(page, ["Accept All Cookies", "Reject All", "Allow All"])
+        # Prefer Accept All Cookies over Reject (xAI sometimes needs consent for auth)
+        hit = await click_text_button(
+            page,
+            ["Accept All Cookies", "Accept All", "Accept all cookies", "Reject All", "Allow All"],
+        )
+        if hit:
+            await asyncio.sleep(0.4)
+            return
     except Exception:
         pass
+    # Role-based fallback (React buttons without stable ids)
+    for name in (r"Accept All Cookies", r"Accept All", r"Reject All"):
+        try:
+            loc = page.get_by_role("button", name=re.compile(name, re.I))
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.click(timeout=2000)
+                await asyncio.sleep(0.4)
+                return
+        except Exception:
+            continue
 
 
 async def click_text_button(page, keywords: list[str], exclude: list[str] | None = None) -> str | None:
@@ -1696,7 +1722,7 @@ async def _handle_turnstile_inner(
     return False
 
 
-# ── OIDC helpers ─────────────────────────────────────────────────────────────
+# ── OIDC helpers (Device OAuth preferred; PKCE kept as fallback) ─────────────
 def generate_pkce_pair() -> tuple[str, str]:
     raw = secrets.token_bytes(96)
     verifier = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -1720,27 +1746,31 @@ def extract_code_from_url(url: str) -> str | None:
     return vals[0] if vals else None
 
 
-def exchange_code_for_tokens(code: str, verifier: str) -> dict:
-    form = urlencode(
-        {
-            "grant_type": "authorization_code",
-            "client_id": XAI_CLIENT_ID,
-            "code": code,
-            "redirect_uri": XAI_REDIRECT_URI,
-            "code_verifier": verifier,
-        }
-    ).encode("utf-8")
+def _oauth_post_form(url: str, form: dict[str, str], timeout: float = 30.0) -> dict:
+    body = urlencode(form).encode("utf-8")
     req = urllib.request.Request(
-        XAI_TOKEN,
-        data=form,
+        url,
+        data=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {"_raw": raw, "error": f"http_{e.code}"}
+        data["_http_status"] = e.code
+        raise RuntimeError(f"oauth POST {url} failed: {data}") from e
+
+
+def _tokens_from_oauth_json(data: dict, email_fallback: str = "", auth_mode: str = "device_oauth") -> dict:
     access = data.get("access_token") or ""
     refresh = data.get("refresh_token") or ""
     if not access or not refresh:
@@ -1748,14 +1778,14 @@ def exchange_code_for_tokens(code: str, verifier: str) -> dict:
     expires_in = int(data.get("expires_in") or 21600)
     expires_at = datetime.now(timezone.utc).timestamp() + expires_in
     expires_at_iso = datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z")
-    email = ""
+    email = email_fallback
     id_token = data.get("id_token") or ""
     if id_token:
         try:
             payload_b64 = id_token.split(".")[1]
             payload_b64 += "=" * (-len(payload_b64) % 4)
             payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
-            email = payload.get("email") or ""
+            email = payload.get("email") or email
         except Exception:
             pass
     tokens = {
@@ -1765,12 +1795,79 @@ def exchange_code_for_tokens(code: str, verifier: str) -> dict:
         "expires_in": expires_in,
         "email": email,
         "client_id": XAI_CLIENT_ID,
-        "auth_mode": "oidc",
+        "auth_mode": auth_mode,
         "scope": data.get("scope") or XAI_SCOPE,
     }
     if id_token:
         tokens["id_token"] = id_token
     return tokens
+
+
+def start_device_authorization() -> dict:
+    """xAI Device OAuth — same as grok2api (works when PKCE consent Access denied)."""
+    return _oauth_post_form(
+        XAI_DEVICE_CODE,
+        {"client_id": XAI_CLIENT_ID, "scope": XAI_SCOPE},
+    )
+
+
+def poll_device_code(device_code: str, interval_s: float = 5.0, timeout_s: float = 180.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    sleep_s = max(3.0, float(interval_s or 5))
+    while time.monotonic() < deadline:
+        body = urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": XAI_CLIENT_ID,
+                "device_code": device_code,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            XAI_TOKEN,
+            data=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {"error": f"http_{e.code}", "_raw": raw}
+        if data.get("access_token"):
+            return data
+        err = (data.get("error") or "").lower()
+        if err == "authorization_pending":
+            time.sleep(sleep_s)
+            continue
+        if err == "slow_down":
+            sleep_s = min(30.0, sleep_s + 2.0)
+            time.sleep(sleep_s)
+            continue
+        if err in ("access_denied", "expired_token", "invalid_grant"):
+            raise RuntimeError(f"device poll denied: {data}")
+        time.sleep(sleep_s)
+    raise TimeoutError("device code poll timed out")
+
+
+def exchange_code_for_tokens(code: str, verifier: str) -> dict:
+    data = _oauth_post_form(
+        XAI_TOKEN,
+        {
+            "grant_type": "authorization_code",
+            "client_id": XAI_CLIENT_ID,
+            "code": code,
+            "redirect_uri": XAI_REDIRECT_URI,
+            "code_verifier": verifier,
+        },
+    )
+    return _tokens_from_oauth_json(data, auth_mode="oidc_pkce")
 
 
 # ── Signup / login UI ────────────────────────────────────────────────────────
@@ -3206,145 +3303,114 @@ async def do_email_login(page, email_addr: str, password: str, attempt: int) -> 
 
 
 async def obtain_oidc_tokens(page, email_addr: str, password: str, attempt: int) -> dict:
-    """Run PKCE authorize + email sign-in + code capture + exchange."""
-    emit_progress(attempt, "oauth", "Starting Grok CLI OAuth PKCE", email_addr)
-    verifier, challenge = generate_pkce_pair()
-    state = secrets.token_urlsafe(24)
-    nonce = secrets.token_hex(16)
-    params = {
-        "response_type": "code",
-        "client_id": XAI_CLIENT_ID,
-        "redirect_uri": XAI_REDIRECT_URI,
-        "scope": XAI_SCOPE,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "state": state,
-        "nonce": nonce,
-        "plan": "generic",
-        "referrer": "cli-proxy-api",
-    }
-    auth_url = f"{XAI_AUTHORIZE}?{urlencode(params)}"
-    auth_code: dict[str, str | None] = {"code": None}
+    """Device OAuth (grok2api-style). PKCE consent currently Access denied on xAI."""
+    emit_progress(attempt, "oauth", "Starting Grok CLI Device OAuth", email_addr)
 
-    async def _handle_route(route):
-        req_url = route.request.url
-        if (
-            req_url.startswith("http://127.0.0.1:56121/")
-            or req_url.startswith("http://localhost:56121/")
-            or ("/callback" in req_url and ("127.0.0.1" in req_url or "localhost" in req_url))
-        ):
-            code = extract_code_from_url(req_url)
-            if code:
-                auth_code["code"] = code
-                print(f"[{attempt}] OAuth code captured via route", flush=True)
-            try:
-                await route.abort()
-            except Exception:
-                pass
-            return
-        try:
-            rtype = route.request.resource_type
-        except Exception:
-            rtype = ""
-        if rtype in ("image", "font", "media"):
-            try:
-                await route.abort()
-            except Exception:
-                pass
-            return
-        try:
-            await route.continue_()
-        except Exception:
-            pass
-
-    await page.route("**/*", _handle_route)
+    # Ensure session (email login) before device approval page
     try:
-        await page.goto(auth_url, wait_until="domcontentloaded", timeout=45000)
+        cur = page.url or ""
     except Exception:
-        await page.goto(auth_url, wait_until="commit", timeout=45000)
-
-    deadline = time.monotonic() + 120.0
-    while time.monotonic() < deadline and not auth_code.get("code"):
+        cur = ""
+    if "sign-in" in cur or await page.locator('input[type="password"]').count() > 0:
+        await click_login_with_email(page)
+        await asyncio.sleep(0.3)
+        await drive_email_password_login(page, email_addr, password, attempt)
+    else:
         try:
-            cur = page.url or ""
-            code = extract_code_from_url(cur)
-            if code:
-                auth_code["code"] = code
-                break
+            cookies = await page.context.cookies()
+            has_sess = any(
+                any(k in (c.get("name") or "").lower() for k in ("session", "auth", "token", "sid"))
+                for c in cookies
+            )
         except Exception:
-            cur = ""
-
-        await recover_page_load_error(page, attempt)
-        await handle_turnstile(page, attempt, max_wait=8)
-
-        # On xAI sign-in: choose Email not Google, then Next → password → Login
-        if "accounts.x.ai" in cur or "auth.x.ai" in cur:
+            has_sess = False
+        if not has_sess:
+            await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(0.8)
             await dismiss_cookie_banner(page)
-            # Provider chooser — UI text is often "Login with email" (not Sign in)
-            if await page.locator('input[type="email"], input[type="password"]').count() == 0:
-                await click_login_with_email(page)
-                await asyncio.sleep(0.4)
-            # Drive email/password fully (includes chooser recovery)
-            has_form = await page.locator('input[type="email"], input[type="password"]').count() > 0
-            has_email_btn = await page.locator("text=/Login with email|Log in with email|Sign in with email/i").count() > 0
-            if has_form or has_email_btn:
-                await drive_email_password_login(page, email_addr, password, attempt)
-            # Consent / allow
-            await click_text_button(
-                page,
-                ["Allow", "Authorize", "Approve", "Accept", "Continue"],
-                exclude=["Google", "Deny", "Cancel", "Go back"],
-            )
-            # OTP during OAuth rare
-            if await page.locator('input[name="code"], input[autocomplete="one-time-code"]').count() > 0:
-                otp = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: read_otp_from_imap_sync(email_addr, 90)
-                )
-                if otp:
-                    chars = re.sub(r"[^A-Z0-9]", "", otp.upper())
-                    await fill_xai_otp_boxes(page, chars, attempt)
-                    await click_text_button(page, ["Confirm", "Verify", "Continue", "Submit"])
-
-        await asyncio.sleep(1.0)
-
-    # Check other pages
-    if not auth_code.get("code"):
-        try:
-            for p in page.context.pages:
-                c = extract_code_from_url(p.url or "")
-                if c:
-                    auth_code["code"] = c
-                    break
-        except Exception:
-            pass
+            await click_login_with_email(page)
+            await drive_email_password_login(page, email_addr, password, attempt)
 
     try:
-        await page.unroute("**/*")
-    except Exception:
-        pass
+        dev = await asyncio.to_thread(start_device_authorization)
+    except Exception as e:
+        raise RuntimeError(f"device/code failed: {e}") from e
 
-    code = auth_code.get("code")
-    if not code:
-        await screenshot(page, attempt, "oauth_no_code")
-        # Richer error for BotLogs (UI often shows only the exception type)
-        try:
-            cur = (page.url or "")[:160]
-            hint = await page.evaluate(
-                """() => {
-                    const t = (document.body && document.body.innerText || '').slice(0, 200);
-                    return t.replace(/\\s+/g, ' ').trim();
-                }"""
+    device_code = dev.get("device_code") or ""
+    user_code = dev.get("user_code") or ""
+    verify = dev.get("verification_uri_complete") or (
+        f"{dev.get('verification_uri', 'https://accounts.x.ai/oauth2/device')}?user_code={user_code}"
+    )
+    interval = float(dev.get("interval") or 5)
+    if not device_code:
+        raise RuntimeError(f"device/code missing device_code: {dev}")
+
+    print(f"[{attempt}] device user_code={user_code}", flush=True)
+
+    poll_task = asyncio.create_task(
+        asyncio.to_thread(poll_device_code, device_code, interval, 180.0)
+    )
+    try:
+        await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(1.0)
+        await dismiss_cookie_banner(page)
+        await recover_page_load_error(page, attempt)
+        await handle_turnstile(page, attempt, max_wait=12)
+
+        if await page.locator('input[type="email"], input[type="password"]').count() > 0:
+            await click_login_with_email(page)
+            await asyncio.sleep(0.3)
+            await drive_email_password_login(page, email_addr, password, attempt)
+            await asyncio.sleep(0.6)
+            await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(1.0)
+
+        for _ in range(10):
+            if poll_task.done():
+                break
+            await handle_turnstile(page, attempt, max_wait=6)
+            body = ""
+            try:
+                body = (await page.inner_text("body"))[:500].lower()
+            except Exception:
+                pass
+            if any(
+                x in body
+                for x in (
+                    "success",
+                    "approved",
+                    "you can close",
+                    "return to",
+                    "device authorized",
+                    "authorization complete",
+                    "already authorized",
+                )
+            ):
+                print(f"[{attempt}] device page looks approved", flush=True)
+                break
+            if "failed to generate" in body or "access denied" in body:
+                print(f"[{attempt}] WARN device page text: access denied / failed generate", flush=True)
+            clicked = await click_text_button(
+                page,
+                ["Continue", "Allow", "Authorize", "Approve", "Confirm", "Yes", "Accept", "Next"],
+                exclude=["Google", "Deny", "Cancel", "Sign out"],
             )
-        except Exception:
-            cur, hint = "", ""
-        raise RuntimeError(
-            f"OAuth code not captured (timeout). url={cur!r} page={hint[:120]!r}. "
-            "Common causes: Login-with-email not clicked, Turnstile stuck, page load error, "
-            "or concurrent browsers stressing the network — not always bad ISP."
-        )
+            await asyncio.sleep(1.0 if clicked else 1.2)
 
-    emit_progress(attempt, "token_exchange", "Exchanging code for tokens", email_addr)
-    tokens = exchange_code_for_tokens(code, verifier)
+        await screenshot(page, attempt, "device_oauth")
+        data = await asyncio.wait_for(poll_task, timeout=200.0)
+    except Exception as e:
+        if not poll_task.done():
+            poll_task.cancel()
+            try:
+                await poll_task
+            except Exception:
+                pass
+        await screenshot(page, attempt, "oauth_no_code")
+        raise RuntimeError(f"Device OAuth failed: {e}") from e
+
+    emit_progress(attempt, "token_exchange", "Device code exchanged for tokens", email_addr)
+    tokens = _tokens_from_oauth_json(data, email_fallback=email_addr, auth_mode="device_oauth")
     if not tokens.get("email"):
         tokens["email"] = email_addr
     return tokens
