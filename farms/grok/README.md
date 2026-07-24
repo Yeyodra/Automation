@@ -5,7 +5,7 @@ Independent of poolprox3 — copy this folder to any VPS and run.
 
 ## What it does
 
-1. Creates emails: catch-all / Gmail plus-trick (**IMAP**) or **gptmail** (API, no IMAP)  
+1. Creates emails: catch-all / Gmail plus-trick (**IMAP**), **gptmail**, or **exzork** (API, no IMAP)  
 2. Registers at `accounts.x.ai` (OTP via IMAP or GPTMail)  
 3. Completes profile + password + Turnstile  
 4. Runs Grok CLI OAuth (PKCE) → `access_token` + `refresh_token`  
@@ -56,9 +56,13 @@ python farm.py -n 20 -c 2 -y
 |----------|---------|--------|
 | `GROK_IMAP_USER` | `you@gmail.com` | Inbox that receives OTP |
 | `GROK_IMAP_PASS` | app password | Gmail App Password |
-| `GROK_EMAIL_MODE` | `domain` | `domain` \| `plus_trick` \| **`gptmail`** |
-| `GROK_EMAIL_DOMAIN` | `koemail.my.id` | catch-all (no `@`) — domain mode |
+| `GROK_EMAIL_MODE` | `domain` | `domain` \| `plus_trick` \| `gptmail` \| **`exzork`** |
+| `GROK_EMAIL_DOMAIN` | `koemail.my.id` | catch-all (no `@`) — domain mode; also default for exzork |
 | `GROK_GPTMAIL_API` | `https://mail.chatgpt.org.uk` | gptmail only |
+| `GROK_EXZORK_API` | `https://mailer.exzork.me` | exzork only |
+| `GROK_EXZORK_API_KEY` | `tm_...` | exzork only (claim key) |
+| `GROK_EXZORK_DOMAIN` | apex | exzork; empty → `GROK_EMAIL_DOMAIN` |
+| `GROK_EXZORK_WILDCARD` | `true` | `local@sub.apex` rotate (needs `*.apex` MX) |
 | `GROK_GPTMAIL_DOMAIN` | (empty) | pin one domain; empty = auto pool + rotate on block |
 | `GROK_PASSWORD` | `$Priyo000` | password for all accounts |
 | `GROK_MAX_ACCOUNTS` | `10` | how many this run |

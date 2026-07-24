@@ -36,11 +36,15 @@ Isi shared keys **tanpa prefix** supaya bisa dipakai banyak farm:
 |------------|--------|----------------|
 | `IMAP_USER` / `IMAP_PASS` | Gmail app password | OTP semua farm |
 | `IMAP_HOST` / `IMAP_PORT` | `imap.gmail.com` / `993` | IMAP |
-| `EMAIL_MODE` | `domain` \| `plus_trick` \| `gptmail` | Mode email |
-| `EMAIL_DOMAIN` | catch-all tanpa `@` | domain mode (IMAP) |
+| `EMAIL_MODE` | `domain` \| `plus_trick` \| `gptmail` \| `exzork` | Mode email |
+| `EMAIL_DOMAIN` | catch-all tanpa `@` | domain mode (IMAP); also default for exzork |
 | `GMAIL_BASE` | base plus-trick | plus_trick (IMAP) |
 | `GPTMAIL_API` | `https://mail.chatgpt.org.uk` | gptmail mode (no IMAP) |
 | `GPTMAIL_DOMAIN` | (empty=auto) | pin domain; empty = pool + block/rotate |
+| `EXZORK_API` | `https://mailer.exzork.me` | exzork mode (no IMAP) |
+| `EXZORK_API_KEY` | `tm_...` | claim key (shown once) |
+| `EXZORK_DOMAIN` | apex without `@` | defaults to `EMAIL_DOMAIN` |
+| `EXZORK_WILDCARD` | `true` | `local@random.apex` (needs `*.apex` MX + claim) |
 | `GPTMAIL_PREFIX` | optional | local-part prefix |
 | `ACCOUNT_PASSWORD` | password akun farm | signup |
 | `HEADLESS` | `true` / `false` | browser |
@@ -54,7 +58,9 @@ Override per-job (opsional, di **hub** `.env` juga):
 ```env
 GROK_PASSWORD=...          # hanya grok, menang atas ACCOUNT_PASSWORD
 GROK_EMAIL_DOMAIN=...
-GROK_EMAIL_MODE=gptmail    # optional; IMAP not required when gptmail
+GROK_EMAIL_MODE=exzork     # or gptmail|domain; IMAP not required when exzork/gptmail
+# EXZORK_API_KEY=tm_...
+# EXZORK_DOMAIN=wowojomok.my.id
 ENTER_GIFT_CODE=...        # nanti saat enter di-bundle
 ENTER_EMAIL_MODE=gptmail
 ```
