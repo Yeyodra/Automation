@@ -29,8 +29,8 @@ $action = New-ScheduledTaskAction `
     -Argument $ActionArgs `
     -WorkingDirectory $ScriptDir
 
-# ── Trigger: every 5 hours ────────────────────────────────────────────────────
-$trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Hours 5) -Once -At (Get-Date)
+# ── Trigger: every 4 hours (access token ~6h; refresh early) ─────────────────
+$trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Hours 4) -Once -At (Get-Date)
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 $settings = New-ScheduledTaskSettingsSet `
@@ -56,13 +56,13 @@ $task = Register-ScheduledTask `
     -Trigger   $trigger `
     -Settings  $settings `
     -Principal $principal `
-    -Description 'Refreshes grok-cli OAuth tokens in the 9router SQLite DB every 5 hours. Runs ASAP if a run was missed while the machine was off.'
+    -Description 'Refreshes grok-cli OAuth tokens in the 9router SQLite DB every 4 hours (HTTP only; revoked tokens need grok-reauth). Runs ASAP if a run was missed while the machine was off.'
 
 Write-Host ''
 Write-Host '==========================================='
 Write-Host " Task registered: $($task.TaskName)"
 Write-Host " Script  : $Ps1Path"
-Write-Host " Schedule: every 5 hours (StartWhenAvailable=true)"
+Write-Host " Schedule: every 4 hours (StartWhenAvailable=true)"
 Write-Host " Limit   : 10 minutes execution timeout"
 Write-Host " Logon   : runs only when user is logged on"
 Write-Host '==========================================='
