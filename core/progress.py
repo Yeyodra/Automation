@@ -15,9 +15,16 @@ Bare step (detail lines):
 
 Terminal outcomes (step name, case-insensitive):
 
-    OK / success / done     → count ok
+    OK / success / done / refresh-ok / reauth-ok  → count ok
+    DEL / deleted           → count deleted (e.g. Access denied purge)
     fail / failed / error   → count fail
-    start / …               → worker running
+    start / START / …       → worker running
+
+Bare lines (no timestamp) also count when first token is OK/DEL/FAIL/START:
+
+    [3] OK user@x.com — ok exp=…
+    [3] DEL user@x.com — Access denied -> DELETED
+    [3] START user@x.com status=unavailable
 
 Examples:
 
@@ -58,8 +65,18 @@ RE_TS_STEP = re.compile(
 RE_BARE_STEP = re.compile(r"^\[(?P<id>\d+)\]\s+(?P<rest>.+)$")
 RE_EMAIL = re.compile(r"<([^>]+@[^>]+)>")
 
-_OK_STEPS = frozenset({"ok", "success", "done", "saved"})
+_OK_STEPS = frozenset(
+    {"ok", "success", "done", "saved", "refresh-ok", "reauth-ok", "refresh_ok", "reauth_ok"}
+)
 _FAIL_STEPS = frozenset({"fail", "failed", "error", "err", "timeout"})
+_DEL_STEPS = frozenset({"del", "deleted", "delete", "purged"})
+_START_STEPS = frozenset({"start", "starting", "begin"})
+RE_TARGETS = re.compile(
+    r"(?i)targets(?:\s*\([^)]*\))?\s*:\s*(?P<n>\d+)"
+)
+RE_DONE = re.compile(
+    r"(?i)\bDONE\b.*\bok=(?P<ok>\d+).*?(?:deleted=(?P<del>\d+).*?)?fail=(?P<fail>\d+)"
+)
 
 
 def _extract_email(text: str) -> str:
@@ -114,7 +131,7 @@ def format_start(attempt: int, email: str = "", message: str = "start") -> str:
 class WorkerState:
     step: str = "?"
     email: str = ""
-    status: str = "run"  # run | ok | fail
+    status: str = "run"  # run | ok | fail | del
 
 
 @dataclass
@@ -124,6 +141,7 @@ class BatchProgress:
     target: int = 0
     ok: int = 0
     fail: int = 0
+    deleted: int = 0
     t0: float = field(default_factory=time.time)
     # attempt_id -> WorkerState  (NOT named workers — avoids Textual clash if mixed in)
     tracks: dict[int, WorkerState] = field(default_factory=dict)
@@ -132,12 +150,13 @@ class BatchProgress:
         self.target = max(0, int(target))
         self.ok = 0
         self.fail = 0
+        self.deleted = 0
         self.t0 = time.time()
         self.tracks.clear()
 
     @property
     def done(self) -> int:
-        return self.ok + self.fail
+        return self.ok + self.fail + self.deleted
 
     @property
     def running(self) -> int:
@@ -148,6 +167,26 @@ class BatchProgress:
         raw = (line or "").strip()
         if not raw:
             return False
+
+        # "Targets (revoked/expired only): 4475" — set bar total when unknown
+        mt = RE_TARGETS.search(raw)
+        if mt:
+            n = int(mt.group("n"))
+            if n > 0 and (self.target <= 0 or n > self.target):
+                self.target = n
+                return True
+
+        # Final summary: DONE ok=… deleted=… fail=…
+        md = RE_DONE.search(raw)
+        if md:
+            try:
+                self.ok = int(md.group("ok") or self.ok)
+                self.fail = int(md.group("fail") or self.fail)
+                if md.group("del") is not None:
+                    self.deleted = int(md.group("del"))
+            except (TypeError, ValueError):
+                pass
+            return True
 
         m = RE_TS_STEP.match(raw)
         if m:
@@ -160,13 +199,23 @@ class BatchProgress:
         m2 = RE_BARE_STEP.match(raw)
         if m2:
             aid = int(m2.group("id"))
-            rest = m2.group("rest")
+            rest = m2.group("rest").strip()
+            # Bare outcome: "[3] OK email — msg" / "[3] DEL …" / "[3] FAIL …" / "[3] START …"
+            first = (rest.split(None, 1)[0] if rest else "").lower()
+            if first in _OK_STEPS or first in _FAIL_STEPS or first in _DEL_STEPS or first in _START_STEPS:
+                rest_body = rest[len(first) :].lstrip(" —-\t")
+                return self._apply_step(aid, first, rest_body)
             w = self.tracks.setdefault(aid, WorkerState())
             if w.status == "run":
                 hint = rest.split(":")[0].strip()[:20]
                 if hint:
                     w.step = hint
                 email = _extract_email(rest)
+                if not email:
+                    # reauth bare lines put email as first token
+                    tok = rest.split(None, 1)[0] if rest else ""
+                    if "@" in tok:
+                        email = tok.strip("<>")
                 if email:
                     w.email = email
             return True
@@ -176,6 +225,10 @@ class BatchProgress:
     def _apply_step(self, aid: int, step: str, rest: str) -> bool:
         step_l = step.lower()
         email = _extract_email(rest)
+        if not email:
+            tok = (rest or "").split(None, 1)[0] if rest else ""
+            if "@" in tok:
+                email = tok.strip("<>")
         w = self.tracks.setdefault(aid, WorkerState())
         if email:
             w.email = email
@@ -185,24 +238,37 @@ class BatchProgress:
             if w.status != "ok":
                 if w.status == "fail":
                     self.fail = max(0, self.fail - 1)
+                elif w.status == "del":
+                    self.deleted = max(0, self.deleted - 1)
                 w.status = "ok"
                 self.ok += 1
             return True
 
+        if step_l in _DEL_STEPS:
+            if w.status != "del":
+                if w.status == "ok":
+                    self.ok = max(0, self.ok - 1)
+                elif w.status == "fail":
+                    self.fail = max(0, self.fail - 1)
+                w.status = "del"
+                self.deleted += 1
+            return True
+
         if step_l in _FAIL_STEPS or rest.lower().startswith("fail"):
-            if w.status not in ("ok", "fail"):
+            if w.status not in ("ok", "fail", "del"):
                 w.status = "fail"
                 self.fail += 1
             return True
 
-        if w.status not in ("ok", "fail"):
-            w.status = "run"
+        if step_l in _START_STEPS or w.status not in ("ok", "fail", "del"):
+            if w.status not in ("ok", "fail", "del"):
+                w.status = "run"
         return True
 
     def render(self, *, bar_width: int = 20, max_active: int = 4) -> str:
         """Multi-line progress block for HUD / CLI."""
         target = self.target
-        ok, fail, running = self.ok, self.fail, self.running
+        ok, fail, deleted, running = self.ok, self.fail, self.deleted, self.running
         done = self.done
 
         if target <= 0 and done == 0 and running == 0:
@@ -215,9 +281,12 @@ class BatchProgress:
         elapsed = int(time.time() - self.t0) if self.t0 else 0
         mm, ss = divmod(max(0, elapsed), 60)
 
+        counts = f"ok={ok}  fail={fail}"
+        if deleted:
+            counts = f"ok={ok}  del={deleted}  fail={fail}"
         lines = [
             f" {bar}  {done}/{tot} ({pct}%)   "
-            f"ok={ok}  fail={fail}  run={running}  {mm:02d}:{ss:02d}"
+            f"{counts}  run={running}  {mm:02d}:{ss:02d}"
         ]
         active = [
             (aid, w)
@@ -237,9 +306,11 @@ class BatchProgress:
         if self.target <= 0 and self.done == 0:
             return "idle"
         tot = self.target or max(self.done, 1)
-        return (
-            f"{self.done}/{tot}  ok={self.ok} fail={self.fail} run={self.running}"
-        )
+        base = f"{self.done}/{tot}  ok={self.ok}"
+        if self.deleted:
+            base += f" del={self.deleted}"
+        return f"{base} fail={self.fail} run={self.running}"
+
 
 
 def make_log_sink(

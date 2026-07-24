@@ -138,19 +138,25 @@ def rewrite_count_args(args: Sequence[str] | list[str], n: int) -> list[str]:
 
 
 def extract_count(args: Sequence[str], default: int = 1) -> int:
-    """Read -n / --count from farm args."""
+    """Read -n / --count from farm args.
+
+    Special: --all (grok-reauth full pool) → return 0 so HUD can treat as unknown total.
+    -n 0 also returns 0 (full pool convention for reauth).
+    """
     a = list(args)
+    if "--all" in a:
+        return 0
     i = 0
     while i < len(a):
         tok = a[i]
         if tok in ("-n", "--count", "--max") and i + 1 < len(a):
             try:
-                return max(1, int(a[i + 1]))
+                return max(0, int(a[i + 1]))
             except ValueError:
                 return default
         if tok.startswith("-n=") or tok.startswith("--count="):
             try:
-                return max(1, int(tok.split("=", 1)[1]))
+                return max(0, int(tok.split("=", 1)[1]))
             except ValueError:
                 return default
         i += 1

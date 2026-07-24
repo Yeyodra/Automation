@@ -71,6 +71,17 @@ JOBS: dict[str, JobDef] = {
         description="Alias of grok",
         env_prefix="GROK_",
     ),
+    "grok-reauth": JobDef(
+        id="grok-reauth",
+        name="grok-reauth",
+        cwd=_GROK,
+        entry="reauth_device_oauth.py",
+        description=(
+            "Grok 9router reauth — HTTP refresh then Device OAuth; "
+            "delete Access-denied rows (HUD: -n 0 = --all)"
+        ),
+        env_prefix="GROK_",
+    ),
     "outlook": JobDef(
         id="outlook",
         name="outlook-farm",

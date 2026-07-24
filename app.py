@@ -70,11 +70,13 @@ def hud_show_line(msg: str) -> bool:
     if not raw.strip():
         return False
     low = raw.lower()
-    if low.startswith(("[hub]", "[jobctl]", "[error]", "[getunikey]")):
+    if low.startswith(("[hub]", "[jobctl]", "[error]", "[getunikey]", "[vps-push]", "[warp]")):
         return True
     if "warp every_n" in low or "warp wave" in low:
         return True
     if "warp: rotate" in low or "warp every_n rotate" in low:
+        return True
+    if "[warp-policy]" in low:
         return True
     if low.startswith("[done]") or "exit=" in low and low.startswith("[hub]"):
         return True
@@ -236,7 +238,7 @@ class HubApp(App[None]):
                     yield Input(
                         value="grok",
                         id="job",
-                        placeholder="grok|enter|outlook|getunikey",
+                        placeholder="grok|grok-reauth|enter|outlook|getunikey",
                     )
                     yield Button("↻", id="btn-job-cycle", variant="primary")
                     yield Label("  -n", id="count-label")
@@ -433,6 +435,7 @@ class HubApp(App[None]):
     def _sync_getunikey_rows(self) -> None:
         """Show Gmail list + referral URL for getunikey; hide -n (pool-sized)."""
         is_guk = self._job_id() in ("getunikey", "getunikey-farm")
+        is_reauth = self._job_id() in ("grok-reauth", "grok_reauth")
         for rid in ("#getunikey-row", "#getunikey-gmail-row"):
             try:
                 self.query_one(rid, Horizontal).set_class(not is_guk, "hidden")
@@ -446,6 +449,11 @@ class HubApp(App[None]):
             if is_guk:
                 count_inp.placeholder = "pool"
                 count_inp.value = "0"
+            elif is_reauth:
+                count_inp.placeholder = "0=all"
+                # keep user value; default 0 = full expired pool
+                if (count_inp.value or "").strip() == "":
+                    count_inp.value = "0"
             else:
                 count_inp.placeholder = "20"
                 if (count_inp.value or "").strip() in ("0", ""):
@@ -660,12 +668,14 @@ class HubApp(App[None]):
         """Returns job, args, dry, n, c, every_n, policy_note.
 
         getunikey: n = Gmail list size (pool); -n 0 means entire pool in farm.
+        grok-reauth: -n 0 → --all (full expired/revoked pool); no -y.
         """
         from core.warp_policy import normalize_every_n
 
         job = self.query_one("#job", Input).value.strip() or "grok"
         jlow = job.lower()
         is_guk = jlow in ("getunikey", "getunikey-farm")
+        is_reauth = jlow in ("grok-reauth", "grok_reauth")
         try:
             c = max(1, int(self.query_one("#concurrent", Input).value.strip() or "1"))
         except ValueError:
@@ -673,6 +683,13 @@ class HubApp(App[None]):
         if is_guk:
             gmails = self._parse_getunikey_gmail_list()
             n = max(1, len(gmails)) if gmails else 0
+        elif is_reauth:
+            # 0 = full pool (--all); >0 = limit
+            try:
+                raw_n = int(self.query_one("#count", Input).value.strip() or "0")
+            except ValueError:
+                raw_n = 0
+            n = max(0, raw_n)
         else:
             try:
                 n = max(1, int(self.query_one("#count", Input).value.strip() or "1"))
@@ -695,12 +712,35 @@ class HubApp(App[None]):
             extra = shlex.split(extra_raw, posix=False) if extra_raw else []
         except ValueError:
             extra = extra_raw.split()
-        if "-y" not in extra and "--yes" not in extra:
-            extra = ["-y", *extra]
-        if is_guk:
+        if is_reauth:
+            # HUD Args often still has farm default -y — strip farm-only flags
+            extra = [
+                x
+                for x in extra
+                if x not in ("-y", "--yes", "--non-interactive")
+            ]
+            # reauth_device_oauth.py: --all when n=0
+            args = ["-c", str(c)]
+            if n <= 0:
+                args = ["--all", *args]
+            else:
+                args = ["-n", str(n), *args]
+            # Pre-rotate once for long pool runs
+            if "--warp-rotate" not in extra and every_n > 0:
+                args.append("--warp-rotate")
+            # Pass through extra flags (e.g. --no-delete-on-access-denied)
+            args = [*args, *extra]
+            # everyN also via hub inject; CLI flag for standalone clarity
+            if every_n > 0 and "--warp-every-n" not in " ".join(extra):
+                args.extend(["--warp-every-n", str(every_n)])
+        elif is_guk:
             # 0 = farm runs entire unused pool (size from GETUNIKEY_ACCOUNTS_LIST)
+            if "-y" not in extra and "--yes" not in extra:
+                extra = ["-y", *extra]
             args = ["-n", "0", "-c", str(c), *extra]
         else:
+            if "-y" not in extra and "--yes" not in extra:
+                extra = ["-y", *extra]
             args = ["-n", str(n), "-c", str(c), *extra]
         dry = bool(self.query_one("#chk-dry", Checkbox).value)
         return job, args, dry, n, c, every_n, note
@@ -809,11 +849,17 @@ class HubApp(App[None]):
             every_n = 0
             policy_note = ""
         self._busy = True
-        self._reset_progress(0 if dry else max(n, 1))
+        # reauth -n 0 = full pool; target fills from "Targets: N" log line
+        if jlow in ("grok-reauth", "grok_reauth"):
+            prog_target = 0 if dry else (n if n > 0 else 0)
+        else:
+            prog_target = 0 if dry else max(n, 1)
+        self._reset_progress(prog_target)
         if policy_note:
             self._log(f"[hub] WARP policy: {policy_note}")
+        n_label = "all" if (jlow in ("grok-reauth", "grok_reauth") and n <= 0) else str(n)
         self._status(
-            f"Running {job} n={n} c={c}"
+            f"Running {job} n={n_label} c={c}"
             + (f" everyN={every_n}" if every_n else " everyN=off")
             + ("" if warp_ok else " WARP=off")
             + (" dry" if dry else "")
