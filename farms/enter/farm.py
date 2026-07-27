@@ -3794,10 +3794,12 @@ def _append_line(path: Path, line: str) -> None:
         f.write(line if line.endswith("\n") else line + "\n")
 
 
-def inject_to_9router(api_key: str, workspace_id: str, email: str = "", name: str = "") -> tuple[bool, str]:
-    """Inject farmed ek_ into 9router SQLite DB (grok-farm style — no HTTP/auth).
+def inject_to_9router(api_key: str, workspace_id: str, email: str = "", name: str = "",
+                      access_token: str = "", refresh_token: str = "", expires_at: str = "") -> tuple[bool, str]:
+    """Inject farmed ek_ + JWT into 9router SQLite DB (grok-farm style — no HTTP/auth).
 
     Writes providerConnections row for enter-converge.
+    Stores both apiKey (ek_) for /chat/completions AND accessToken (JWT) for project-chat models.
     Returns (ok, detail). Skips when disabled / DB missing / duplicate key.
     """
     import sqlite3
@@ -3837,11 +3839,24 @@ def inject_to_9router(api_key: str, workspace_id: str, email: str = "", name: st
             except Exception:
                 d = {}
             if (d.get("apiKey") or "") == api_key:
-                # refresh workspaceId if missing
+                # refresh workspaceId if missing + update JWT tokens
                 psd = d.get("providerSpecificData") or {}
+                updated = False
                 if ws and not psd.get("workspaceId"):
                     psd["workspaceId"] = ws
                     d["providerSpecificData"] = psd
+                    updated = True
+                # Always refresh JWT if provided (tokens expire 24h)
+                if access_token:
+                    d["accessToken"] = access_token
+                    updated = True
+                if refresh_token:
+                    d["refreshToken"] = refresh_token
+                    updated = True
+                if expires_at:
+                    d["expiresAt"] = expires_at
+                    updated = True
+                if updated:
                     d["testStatus"] = d.get("testStatus") or "active"
                     cur.execute(
                         "UPDATE providerConnections SET data = ?, updatedAt = ? WHERE id = ?",
@@ -3862,6 +3877,13 @@ def inject_to_9router(api_key: str, workspace_id: str, email: str = "", name: st
             "lastError": None,
             "lastErrorAt": None,
         }
+        # JWT for project-chat models (opus 4.8, sonnet 5, gemini etc)
+        if access_token:
+            data_obj["accessToken"] = access_token
+        if refresh_token:
+            data_obj["refreshToken"] = refresh_token
+        if expires_at:
+            data_obj["expiresAt"] = expires_at
         if ws:
             data_obj["providerSpecificData"]["workspaceId"] = ws
         if email_l:
@@ -3986,7 +4008,14 @@ async def save_result_to_file(result: dict) -> None:
 
         # Auto-inject into 9router Enter Converge pool (optional)
         if api_key and NINEROUTER_INJECT:
-            ok_inj, detail = inject_to_9router(api_key, ws, email=email, name="")
+            # Pass JWT tokens for project-chat models (opus 4.8, sonnet 5, gemini)
+            tokens = result.get("tokens") or {}
+            ok_inj, detail = inject_to_9router(
+                api_key, ws, email=email, name="",
+                access_token=tokens.get("access_token", ""),
+                refresh_token=tokens.get("refresh_token", ""),
+                expires_at=tokens.get("expires_at", ""),
+            )
             if ok_inj:
                 slog("9ROUTER", f"injected {email} ws={ws} -> {detail}")
             else:
