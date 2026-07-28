@@ -515,9 +515,9 @@ MAX_ACCOUNTS = int(_env("ENTER_MAX_ACCOUNTS", "1") or "1")
 CONCURRENT = int(_env("ENTER_CONCURRENT", "1") or "1")
 HEADLESS = _env_bool("ENTER_HEADLESS", False)
 # Safe defaults for direct-IP farming (override via .env / CLI)
-SPAWN_DELAY = float(_env("ENTER_SPAWN_DELAY", "45") or "45")
+SPAWN_DELAY = float(_env("ENTER_SPAWN_DELAY", "30") or "30")
 # After each account finishes (ok/fail), pause before freeing the worker slot
-ACCOUNT_GAP = float(_env("ENTER_ACCOUNT_GAP", "75") or "75")
+ACCOUNT_GAP = float(_env("ENTER_ACCOUNT_GAP", "30") or "30")
 # Global pause when Auth0 shows "Too many signup attempts"
 RATE_LIMIT_COOLDOWN = float(_env("ENTER_RATE_LIMIT_COOLDOWN", "300") or "300")
 # Hub global WARP every-N (injected as WARP_EVERY_N / ENTER_WARP_EVERY_N). 0 = off.
