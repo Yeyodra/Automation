@@ -515,9 +515,9 @@ MAX_ACCOUNTS = int(_env("ENTER_MAX_ACCOUNTS", "1") or "1")
 CONCURRENT = int(_env("ENTER_CONCURRENT", "1") or "1")
 HEADLESS = _env_bool("ENTER_HEADLESS", False)
 # Safe defaults for direct-IP farming (override via .env / CLI)
-SPAWN_DELAY = float(_env("ENTER_SPAWN_DELAY", "35") or "35")
+SPAWN_DELAY = float(_env("ENTER_SPAWN_DELAY", "45") or "45")
 # After each account finishes (ok/fail), pause before freeing the worker slot
-ACCOUNT_GAP = float(_env("ENTER_ACCOUNT_GAP", "60") or "60")
+ACCOUNT_GAP = float(_env("ENTER_ACCOUNT_GAP", "75") or "75")
 # Global pause when Auth0 shows "Too many signup attempts"
 RATE_LIMIT_COOLDOWN = float(_env("ENTER_RATE_LIMIT_COOLDOWN", "300") or "300")
 # Hub global WARP every-N (injected as WARP_EVERY_N / ENTER_WARP_EVERY_N). 0 = off.
@@ -634,6 +634,10 @@ _gptmail_domains_ts = 0.0
 _gptmail_slot_domain: dict[int, str] = {}
 _gptmail_blocked_domains: set[str] = set()
 _gptmail_domain_rr = 0  # round-robin for fresh domain picks
+# Per-domain consecutive fail counter: domain -> fail_count (resets on success)
+_domain_fail_count: dict[str, int] = {}
+_domain_fail_lock = threading.Lock()
+DOMAIN_AUTO_BLOCK_THRESHOLD = 5  # auto-blacklist after N consecutive fails
 
 
 
@@ -901,6 +905,30 @@ async def raise_if_rate_limited(page, attempt: int, where: str) -> None:
     await screenshot(page, attempt, f"rate_limit_{where}")
     await _trip_rate_limit(attempt, f"{where}: {reason}")
     raise RuntimeError(f"Too many signup attempts ({where}): {reason}")
+
+
+# ── Risk session (bypass Auth0 risk_control_blocked) ─────────────────────────
+def _get_risk_session_id() -> str | None:
+    """Get risk_session_id from Enter API. Accepts random FPJS data."""
+    vid = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
+    eid = f"{int(time.time() * 1000)}.{''.join(secrets.choice(string.ascii_letters) for _ in range(6))}"
+    data = json.dumps({"fp_event_id": eid, "visitor_id": vid, "platform": "web"}).encode()
+    req = urllib.request.Request(
+        f"{API_HOST}/code/api/v1/auth/risk-session",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Origin": APP_HOST,
+            "Referer": f"{APP_HOST}/",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return json.loads(resp.read())["data"]["risk_session_id"]
+    except Exception:
+        return None
 
 
 # ── Proxy helpers (grok-farm compatible) ─────────────────────────────────────
@@ -1453,6 +1481,27 @@ def gptmail_block_domain(domain: str, reason: str = "", worker_slot: int | None 
         f"(persisted → {BLOCKED_DOMAINS_FILE.name})",
         flush=True,
     )
+
+
+def _domain_fail_track(email_addr: str, reason: str, worker_slot: int | None = None) -> None:
+    """Track consecutive fails per domain; auto-blacklist after threshold."""
+    dom = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
+    if not dom:
+        return
+    with _domain_fail_lock:
+        _domain_fail_count[dom] = _domain_fail_count.get(dom, 0) + 1
+        count = _domain_fail_count[dom]
+    if count >= DOMAIN_AUTO_BLOCK_THRESHOLD:
+        gptmail_block_domain(dom, reason=f"auto: {count} consecutive fails", worker_slot=worker_slot)
+
+
+def _domain_fail_reset(email_addr: str) -> None:
+    """Reset fail counter on success."""
+    dom = email_addr.split("@")[-1].lower() if "@" in email_addr else ""
+    if not dom:
+        return
+    with _domain_fail_lock:
+        _domain_fail_count.pop(dom, None)
 
 
 def _gptmail_make_local() -> str:
@@ -3080,7 +3129,14 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
     await goto_with_retry(page, land, attempt, label="landing")
     await asyncio.sleep(2.0)
 
-    # 2) Start authorize with PKCE (SPA may also redirect - we force known params)
+    # 2) Get risk_session_id (bypasses Auth0 risk_control_blocked)
+    rs_id = _get_risk_session_id()
+    if rs_id:
+        alog(attempt, f"risk_session: {rs_id[:20]}…")
+    else:
+        alog(attempt, "risk_session: FAILED (continuing without)")
+
+    # 3) Start authorize with PKCE + risk_session_id
     params = {
         "client_id": CLIENT_ID,
         "scope": SCOPE,
@@ -3091,7 +3147,10 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": state,
+        "auth0Client": "eyJuYW1lIjoiYXV0aDAtcmVhY3QiLCJ2ZXJzaW9uIjoiMi4xMC4wIn0=",
     }
+    if rs_id:
+        params["risk_session_id"] = rs_id
     auth_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
     alog(attempt, f"Authorize...")
     await goto_with_retry(page, auth_url, attempt, label="authorize")
@@ -3542,6 +3601,7 @@ async def _dismiss_app_modals(page) -> None:
 async def _start_authorize(page, challenge: str, email_addr: str, attempt: int, *, prompt: str | None = "login") -> None:
     """Navigate to Auth0 /authorize with OUR PKCE (must match token exchange verifier)."""
     state = secrets.token_urlsafe(24)
+    rs_id = _get_risk_session_id()
     params = {
         "client_id": CLIENT_ID,
         "scope": SCOPE,
@@ -3553,9 +3613,12 @@ async def _start_authorize(page, challenge: str, email_addr: str, attempt: int, 
         "code_challenge_method": "S256",
         "state": state,
         "login_hint": email_addr,
+        "auth0Client": "eyJuYW1lIjoiYXV0aDAtcmVhY3QiLCJ2ZXJzaW9uIjoiMi4xMC4wIn0=",
     }
     if prompt:
         params["prompt"] = prompt
+    if rs_id:
+        params["risk_session_id"] = rs_id
     auth_url = f"{AUTHORIZE_URL}?{urlencode(params)}"
     alog(attempt, f"authorize prompt={prompt or 'none'}...")
     await goto_with_retry(
@@ -4127,6 +4190,7 @@ async def register_one_account(
                     timeout=ACCOUNT_TIMEOUT_S,
                 )
                 await save_result_to_file(result)
+                _domain_fail_reset(email_addr)
                 emit_success(attempt, email_addr, "ok")
                 await _maybe_warp_after_success(attempt)
                 return result
@@ -4146,6 +4210,9 @@ async def register_one_account(
                     or "nav timeout" in low
                     or "still on blank" in low
                 )
+                # Track per-domain fails (auto-blacklist after threshold)
+                if not nav_fail:
+                    _domain_fail_track(email_addr, msg[:120], worker_slot=worker_slot)
                 is_domain_block = EMAIL_MODE == "gptmail" and (
                     "domain_not_allowed" in low
                     or "domain is not allowed" in low
