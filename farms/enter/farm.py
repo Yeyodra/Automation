@@ -3437,6 +3437,9 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
         alog(attempt, f"password submitted ({clicked})")
         await asyncio.sleep(2.0)
         # Banner often appears on the same password page after Continue
+        dom_block = await page_has_domain_block(page)
+        if dom_block:
+            raise RuntimeError(f"domain_not_allowed: {dom_block}")
         await raise_if_rate_limited(page, attempt, "after_password")
 
     # Wait briefly for OAuth code (happy path: signup resumes authorize)
@@ -3478,7 +3481,7 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
     await raise_if_rate_limited(page, attempt, "before_signin_recovery")
     await screenshot(page, attempt, "after_password_no_code")
     alog(attempt, f"recovery: Sign in + snarf SPA tokens")
-    tokens = await _signin_snarf_tokens(page, attempt, token_bag)
+    tokens = await _signin_snarf_tokens(page, attempt, token_bag, email_addr, password)
     if not tokens:
         # final rate-limit check (banner may be why snarf failed)
         await raise_if_rate_limited(page, attempt, "after_snarf_fail")
@@ -3518,7 +3521,7 @@ def _normalize_token_response(data: dict) -> dict:
     }
 
 
-async def _signin_snarf_tokens(page, attempt: int, token_bag: dict) -> dict | None:
+async def _signin_snarf_tokens(page, attempt: int, token_bag: dict, email_addr: str = "", password: str = "") -> dict | None:
     """Click Sign in like a human; wait for SPA POST /oauth/token; return tokens."""
     token_bag["tokens"] = None
     # If already rate-limited, Sign in is not on page — fail fast (caller trips cooldown)
@@ -3566,6 +3569,22 @@ async def _signin_snarf_tokens(page, attempt: int, token_bag: dict) -> dict | No
                 "scope": SCOPE,
             })
         u = page.url
+        # Auth0 login form after "Sign in" click — fill credentials to complete OAuth
+        if email_addr and password and not bearer_bag.get("_login_filled") and (
+            "/u/login" in u or ("/u/signup" in u and "identifier" not in u)
+        ):
+            alog(attempt, "recovery: Auth0 login form detected, filling credentials")
+            await fill_input(page, ['input[name="username"]', 'input[name="email"]', 'input[type="email"]'], email_addr)
+            await asyncio.sleep(0.3)
+            await click_text_button(page, ["Continue", "Next", "Submit"])
+            await asyncio.sleep(1.5)
+            await fill_input(page, ['input[name="password"]', 'input[type="password"]'], password)
+            await asyncio.sleep(0.3)
+            await click_text_button(page, ["Continue", "Log in", "Sign in", "Submit"])
+            bearer_bag["_login_filled"] = True
+            alog(attempt, "recovery: login form submitted")
+            await asyncio.sleep(3.0)
+            continue
         # SPA sometimes stores tokens without us seeing /oauth/token if cached session
         if (
             "enter.converge.ai" in u
