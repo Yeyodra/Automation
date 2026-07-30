@@ -174,7 +174,22 @@ ssh root@<IP_VPS> "sed -i '/^ENTER_GIFT_CODE/d' /home/auto/Automation/.env; echo
 # Then restart farm
 ```
 
-### Pull results to local (Windows)
+### Auto-push ke 9router VPS (default: ON)
+
+Farm otomatis push credentials ke remote 9router VPS setiap **3 OK** (configurable).
+
+```env
+# .env di farm VPS
+ENTER_9ROUTER_VPS_EVERY_N=3          # push setiap 3 OK (0=off)
+NINEROUTER_VPS_HOST=43.156.135.115   # 9router VPS
+NINEROUTER_VPS_USER=ubuntu
+NINEROUTER_VPS_PW=Bintang_088
+```
+
+Tidak perlu pull manual lagi — credentials langsung masuk 9router DB remote.
+Module: `core/ninerouter.py` (reusable semua farm).
+
+### Pull results to local (Windows) — legacy/manual
 
 ```bash
 python farms/enter/pull_vps_inject.py

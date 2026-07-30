@@ -10,6 +10,7 @@ When the user asks to add a farm / provider / automation (Enter, Cursor, …):
    - `core/progress.py` — success/fail progress from logs  
    - `jobs/runner.py` — subprocess + inject `WARP_EVERY_N` (in-farm rotate after N OK)  
    - `core/jobctl.py` — **stop_all()** global kill farm process tree  
+   - `core/ninerouter.py` — **NinerouterPusher** batch push to remote 9router VPS (SSH+SQLite, every_n configurable)  
 4. **Touch:** `farms/<id>/` + `jobs/registry.py` (+ hub `requirements.txt` if new deps).  
 5. **WARP everyN:** **1:1 with `-c`** (hub auto-fixes). `0`=off. Counter = **OK only**. Drain peers → rotate → settle.  
 6. **Verify:** `python -m jobs list` and `--dry-run --warp-every-n 2 -- -n 9 -c 3 -y` (expect everyN→3).  

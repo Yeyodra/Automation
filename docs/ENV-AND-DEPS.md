@@ -217,6 +217,43 @@ Env: `WARP_EVERY_N` / `GROK_WARP_EVERY_N`, `WARP_SETTLE_AFTER` (default ~8), `WA
 python scripts/9router_mark_active.py --provider grok-cli
 ```
 
+### 2.5 9router VPS push (`core/ninerouter.py`)
+
+Auto-push farmed credentials to remote 9router SQLite via SSH, batched every N OK.
+
+| Layer | Module | Role |
+|-------|--------|------|
+| Core | `core/ninerouter.py` | `NinerouterPusher` class — queue + batch SSH push |
+| Farm | e.g. `farms/enter/farm.py` | call `pusher.queue(cred)` after each OK |
+
+**Env (hub `.env`):**
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `NINEROUTER_VPS_HOST` | `43.156.135.115` | SSH host of 9router VPS |
+| `NINEROUTER_VPS_USER` | `ubuntu` | SSH user |
+| `NINEROUTER_VPS_PW` | — | SSH password |
+| `NINEROUTER_VPS_DB` | `/home/ubuntu/.9router/db/data.sqlite` | remote DB path |
+| `NINEROUTER_VPS_SQLITE` | `/home/ubuntu/scripts/grok-refresh/node_modules/better-sqlite3` | remote better-sqlite3 |
+| `ENTER_9ROUTER_VPS_EVERY_N` | `3` | push every N OK (0=off) |
+
+**Usage in farm:**
+
+```python
+from core.ninerouter import NinerouterPusher, make_credential
+
+pusher = NinerouterPusher(provider="enter-converge", every_n=3)
+
+# After each successful account:
+cred = make_credential("enter-converge", email, data_dict)
+pusher.queue(cred)  # auto-pushes at every_n
+
+# On exit:
+pusher.flush()
+```
+
+Reusable by any farm — change `provider` and `every_n`. Deduplicates by email on remote.
+
 ---
 
 ## 3. Runtime data (local farm)

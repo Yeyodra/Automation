@@ -18,7 +18,8 @@ Automation/                          HUB (global)
 │   ├── warp.py                      rotate / connect / IP
 │   ├── warp_policy.py               everyN 1:1 with -c + helpers
 │   ├── progress.py                  parse OK/fail from log lines
-│   └── jobctl.py                    stop_all() process tree
+│   ├── jobctl.py                    stop_all() process tree
+│   └── ninerouter.py                batch push credentials to remote 9router VPS
 ├── jobs/
 │   ├── registry.py                  ← register new job here
 │   └── runner.py                    env inject + WARP_EVERY_N → farm
