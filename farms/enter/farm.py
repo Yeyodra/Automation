@@ -564,6 +564,9 @@ _NINEROUTER_DB_DEFAULT = str(
     Path(os.environ.get("APPDATA", "")) / "9router" / "db" / "data.sqlite"
 )
 NINEROUTER_DB = _env("ENTER_9ROUTER_DB", _NINEROUTER_DB_DEFAULT)
+# VPS push: auto-push to remote 9router every N OK (0=off)
+NINEROUTER_VPS_EVERY_N = max(0, int(_env("ENTER_9ROUTER_VPS_EVERY_N", "3") or "3"))
+_vps_pusher = None  # initialized in main() if every_n > 0
 
 # Auth0/catch-all can be slow; grok uses 120–180 default — we use 180
 OTP_TIMEOUT_S = max(60, int(_env("ENTER_OTP_TIMEOUT", "180") or "180"))
@@ -4150,6 +4153,27 @@ async def save_result_to_file(result: dict) -> None:
             else:
                 slog("9ROUTER", f"inject failed {email}: {detail}")
 
+        # Auto-push to remote 9router VPS (batched every N)
+        if api_key and _vps_pusher is not None:
+            tokens = result.get("tokens") or {}
+            data_obj = {
+                "displayName": email,
+                "apiKey": api_key,
+                "testStatus": "active",
+                "providerSpecificData": {"workspaceId": ws, "email": email},
+                "lastError": None,
+                "lastErrorAt": None,
+            }
+            if tokens.get("access_token"):
+                data_obj["accessToken"] = tokens["access_token"]
+            if tokens.get("refresh_token"):
+                data_obj["refreshToken"] = tokens["refresh_token"]
+            if tokens.get("expires_at"):
+                data_obj["expiresAt"] = tokens["expires_at"]
+            from core.ninerouter import make_credential
+            cred = make_credential(NINEROUTER_PROVIDER, email, data_obj)
+            _vps_pusher.queue(cred)
+
 
 async def save_failed_to_file(attempt: int, email: str, err: str) -> None:
     async with _results_lock:
@@ -4418,6 +4442,12 @@ async def main() -> None:
     CONCURRENT = c
     MAX_ACCOUNTS = n
     init_batch(n, c)
+    # Init VPS pusher (remote 9router)
+    global _vps_pusher
+    if NINEROUTER_VPS_EVERY_N > 0:
+        from core.ninerouter import NinerouterPusher
+        _vps_pusher = NinerouterPusher(provider=NINEROUTER_PROVIDER, every_n=NINEROUTER_VPS_EVERY_N)
+        slog("9ROUTER", f"VPS push enabled: every_n={NINEROUTER_VPS_EVERY_N} host={_vps_pusher.host}")
     HUD.start(n, BATCH_ID, str(BATCH_DIR), gift=GIFT_CODE)
     _dom_label = EMAIL_DOMAIN or GMAIL_BASE
     if EMAIL_MODE == "gptmail":
@@ -4469,6 +4499,11 @@ async def main() -> None:
         HUD.stop()
         HUD.close_log()
     ok = sum(1 for r in results if r)
+    # Flush remaining VPS push queue
+    if _vps_pusher is not None:
+        _vps_pusher.flush()
+        s = _vps_pusher.stats
+        slog("9ROUTER", f"VPS push final: pushed={s['pushed']} failed={s['failed']}")
     slog("DONE", f"ok={ok}/{n} batch={BATCH_DIR}")
     if not HUD.enabled:
         print(f"[DONE] ok={ok}/{n} batch={BATCH_DIR}", flush=True)
