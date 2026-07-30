@@ -3525,6 +3525,19 @@ async def _signin_snarf_tokens(page, attempt: int, token_bag: dict) -> dict | No
     await raise_if_rate_limited(page, attempt, "signin_snarf_entry")
     await _dismiss_app_modals(page)
 
+    # Also snarf Bearer tokens from outgoing API requests (Auth0 SPA SDK v2+ stores in-memory)
+    bearer_bag: dict[str, str] = {}
+
+    def _on_request(req):
+        try:
+            auth = req.headers.get("authorization") or ""
+            if auth.startswith("Bearer eyJ") and not bearer_bag.get("access_token"):
+                bearer_bag["access_token"] = auth[7:]
+        except Exception:
+            pass
+
+    page.on("request", _on_request)
+
     signed = await click_text_button(
         page, ["Sign in", "Sign In", "Log in", "Log In", "Get Free Credits"]
     )
@@ -3539,7 +3552,19 @@ async def _signin_snarf_tokens(page, attempt: int, token_bag: dict) -> dict | No
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         if token_bag["tokens"]:
+            page.remove_listener("request", _on_request)
             return _normalize_token_response(token_bag["tokens"])
+        # Check bearer from outgoing requests
+        if bearer_bag.get("access_token"):
+            alog(attempt, "tokens snarfed from outgoing API request Bearer header")
+            page.remove_listener("request", _on_request)
+            return _normalize_token_response({
+                "access_token": bearer_bag["access_token"],
+                "refresh_token": "",
+                "expires_in": 86400,
+                "token_type": "Bearer",
+                "scope": SCOPE,
+            })
         u = page.url
         # SPA sometimes stores tokens without us seeing /oauth/token if cached session
         if (
@@ -3549,19 +3574,53 @@ async def _signin_snarf_tokens(page, attempt: int, token_bag: dict) -> dict | No
             and "auth.converge" not in u
             and "code=" not in u
         ):
-            # give SPA a bit more time to hit token endpoint
-            await asyncio.sleep(1.5)
+            # give SPA a bit more time to hit token endpoint or make API calls
+            await asyncio.sleep(2.0)
             if token_bag["tokens"]:
+                page.remove_listener("request", _on_request)
                 return _normalize_token_response(token_bag["tokens"])
+            if bearer_bag.get("access_token"):
+                alog(attempt, "tokens snarfed from outgoing API request Bearer header")
+                page.remove_listener("request", _on_request)
+                return _normalize_token_response({
+                    "access_token": bearer_bag["access_token"],
+                    "refresh_token": "",
+                    "expires_in": 86400,
+                    "token_type": "Bearer",
+                    "scope": SCOPE,
+                })
             # try reading access_token from localStorage / sessionStorage
             tok = await _tokens_from_storage(page)
             if tok:
                 alog(attempt, f"tokens from storage")
+                page.remove_listener("request", _on_request)
                 return tok
+            # Trigger SPA API call to flush Bearer from memory
+            await page.evaluate("fetch('/api/user/me',{credentials:'include'}).catch(()=>{})")
+            await asyncio.sleep(1.0)
+            if bearer_bag.get("access_token"):
+                alog(attempt, "tokens snarfed after triggered /api/user/me")
+                page.remove_listener("request", _on_request)
+                return _normalize_token_response({
+                    "access_token": bearer_bag["access_token"],
+                    "refresh_token": "",
+                    "expires_in": 86400,
+                    "token_type": "Bearer",
+                    "scope": SCOPE,
+                })
         await asyncio.sleep(0.4)
 
+    page.remove_listener("request", _on_request)
     if token_bag["tokens"]:
         return _normalize_token_response(token_bag["tokens"])
+    if bearer_bag.get("access_token"):
+        return _normalize_token_response({
+            "access_token": bearer_bag["access_token"],
+            "refresh_token": "",
+            "expires_in": 86400,
+            "token_type": "Bearer",
+            "scope": SCOPE,
+        })
     tok = await _tokens_from_storage(page)
     if tok:
         return tok
