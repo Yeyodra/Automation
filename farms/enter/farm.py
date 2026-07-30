@@ -1116,22 +1116,31 @@ def init_batch(max_accounts: int, concurrent: int) -> str:
 
 
 def _http_json(url: str, data: dict | None = None, headers: dict | None = None, method: str | None = None) -> dict | list:
-    """Minimal JSON HTTP helper (stdlib)."""
+    """JSON HTTP helper — routes via proxy pool to avoid Cloudflare 428."""
+    import requests as _req
+
+    _BROWSER_UA = (
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    )
     h = {
         "Accept": "application/json",
-        "User-Agent": "enter-farm/tempmail",
+        "User-Agent": _BROWSER_UA,
     }
     if headers:
         h.update(headers)
-    body = None
-    if data is not None:
-        body = json.dumps(data).encode("utf-8")
-        h["Content-Type"] = "application/json"
-        method = method or "POST"
-    req = urllib.request.Request(url, data=body, headers=h, method=method or "GET")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", "replace")
-        return json.loads(raw) if raw else {}
+    # ponytail: proxy only for gptmail API; upgrade to session pool when needed
+    proxies = None
+    if _proxy_pool and "chatgpt.org.uk" in url:
+        proxy_url = _proxy_pool[_proxy_idx % len(_proxy_pool)][0] if _proxy_pool else None
+        if proxy_url:
+            # socks5:// → socks5h:// for DNS resolution through proxy
+            p = proxy_url.replace("socks5://", "socks5h://")
+            proxies = {"http": p, "https": p}
+    m = method or ("POST" if data is not None else "GET")
+    resp = _req.request(m, url, json=data if data is not None else None,
+                        headers=h, proxies=proxies, timeout=30)
+    resp.raise_for_status()
+    return resp.json() if resp.text else {}
 
 
 def _tempmail_pick_domain() -> str:
@@ -1312,7 +1321,6 @@ def read_otp_from_tempmail_sync(target_email: str, timeout: int = 180, since_ts:
 def _gptmail_headers(token: str = "") -> dict[str, str]:
     h = {
         "Accept": "application/json",
-        "User-Agent": "enter-farm/gptmail",
         "Origin": GPTMAIL_API,
         "Referer": f"{GPTMAIL_API}/",
     }
@@ -1530,14 +1538,16 @@ def create_gptmail_inbox(worker_slot: int | None = None) -> str:
                 {"email": addr},
                 headers=_gptmail_headers(),
             )
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "ignore")
-            last_err = f"HTTP {e.code}: {body[:160]}"
-            if e.code in (409, 422, 429, 400):
-                time.sleep(0.3 + attempt * 0.1)
-                continue
-            raise RuntimeError(f"gptmail inbox-token {last_err}") from e
         except Exception as e:
+            import requests as _req
+            if isinstance(e, _req.HTTPError) and e.response is not None:
+                code = e.response.status_code
+                body = e.response.text[:160]
+                last_err = f"HTTP {code}: {body}"
+                if code in (409, 422, 429, 400, 428):
+                    time.sleep(0.3 + attempt * 0.1)
+                    continue
+                raise RuntimeError(f"gptmail inbox-token {last_err}") from e
             last_err = str(e)
             time.sleep(0.4)
             continue
