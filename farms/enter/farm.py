@@ -628,6 +628,8 @@ _tempmail_lock = threading.Lock()
 # gptmail (mail.chatgpt.org.uk): address -> {token, sid, expires_at}
 _gptmail_accounts: dict[str, dict[str, str]] = {}
 _gptmail_lock = threading.Lock()
+_gptmail_session_cookies: dict[str, str] = {}  # cookie jar for verified gptmail session
+_gptmail_session_lock = threading.Lock()
 _gptmail_domains_cache: list[str] = []
 _gptmail_domains_ts = 0.0
 # sticky domain per worker slot: slot -> domain; blocklist when Auth0 rejects domain
@@ -1115,8 +1117,59 @@ def init_batch(max_accounts: int, concurrent: int) -> str:
     return BATCH_ID
 
 
+def _gptmail_solve_turnstile() -> bool:
+    """Visit gptmail via Camoufox, click Random to trigger Turnstile solve, extract session cookies.
+    Call once at farm startup. Returns True if session verified."""
+    import asyncio as _aio
+
+    async def _solve():
+        from camoufox.async_api import AsyncCamoufox
+
+        proxy_server = None
+        if _proxy_pool:
+            proxy_server = {"server": _proxy_pool[0][0].replace("socks5://", "socks5://")}
+        kwargs = {"headless": True, "geoip": True}
+        if proxy_server:
+            kwargs["proxy"] = proxy_server
+        async with AsyncCamoufox(**kwargs) as browser:
+            page = await browser.new_page()
+            await page.goto("https://mail.chatgpt.org.uk/", wait_until="networkidle", timeout=30000)
+            await _aio.sleep(3)
+            # Click Random — triggers inbox-token → 428 → app solves Turnstile → verifies
+            btn = page.locator("button:has-text('Random')")
+            if await btn.count() > 0:
+                await btn.click()
+                # Wait for URL change (app redirects to /email@domain after success)
+                for _ in range(30):
+                    await _aio.sleep(1)
+                    if "@" in page.url:
+                        break
+            # Extract cookies
+            cookies = await page.context.cookies()
+            cookie_dict = {}
+            for ck in cookies:
+                if "chatgpt.org.uk" in ck.get("domain", ""):
+                    cookie_dict[ck["name"]] = ck["value"]
+            with _gptmail_session_lock:
+                _gptmail_session_cookies.update(cookie_dict)
+            return "@" in page.url  # success if page has inbox email in URL
+
+    try:
+        loop = _aio.new_event_loop()
+        ok = loop.run_until_complete(_solve())
+        loop.close()
+        if ok:
+            print("[GPTMAIL] Turnstile session verified via browser", flush=True)
+        else:
+            print("[GPTMAIL] Turnstile solve: page did not redirect (may still work)", flush=True)
+        return ok
+    except Exception as e:
+        print(f"[GPTMAIL] Turnstile solve failed: {e}", flush=True)
+        return False
+
+
 def _http_json(url: str, data: dict | None = None, headers: dict | None = None, method: str | None = None) -> dict | list:
-    """JSON HTTP helper — routes via proxy pool to avoid Cloudflare 428."""
+    """JSON HTTP helper — uses verified gptmail session cookies + proxy."""
     import requests as _req
 
     _BROWSER_UA = (
@@ -1128,17 +1181,20 @@ def _http_json(url: str, data: dict | None = None, headers: dict | None = None, 
     }
     if headers:
         h.update(headers)
-    # ponytail: proxy only for gptmail API; upgrade to session pool when needed
     proxies = None
-    if _proxy_pool and "chatgpt.org.uk" in url:
-        proxy_url = _proxy_pool[_proxy_idx % len(_proxy_pool)][0] if _proxy_pool else None
-        if proxy_url:
-            # socks5:// → socks5h:// for DNS resolution through proxy
-            p = proxy_url.replace("socks5://", "socks5h://")
+    cookies = None
+    if "chatgpt.org.uk" in url:
+        # Use proxy
+        if _proxy_pool:
+            p = _proxy_pool[_proxy_idx % len(_proxy_pool)][0].replace("socks5://", "socks5h://")
             proxies = {"http": p, "https": p}
+        # Attach session cookies from Turnstile verification
+        with _gptmail_session_lock:
+            if _gptmail_session_cookies:
+                cookies = dict(_gptmail_session_cookies)
     m = method or ("POST" if data is not None else "GET")
     resp = _req.request(m, url, json=data if data is not None else None,
-                        headers=h, proxies=proxies, timeout=30)
+                        headers=h, proxies=proxies, cookies=cookies, timeout=30)
     resp.raise_for_status()
     return resp.json() if resp.text else {}
 
@@ -4377,6 +4433,11 @@ async def main() -> None:
     )
     if not _proxy_pool:
         slog("WARN", "no proxies loaded - concurrent signup from one IP often hits rate limits. Put proxies in proxies.txt")
+
+    # Solve Turnstile for gptmail session before workers start
+    if EMAIL_MODE == "gptmail":
+        slog("GPTMAIL", "solving Turnstile for API session...")
+        await asyncio.get_event_loop().run_in_executor(None, _gptmail_solve_turnstile)
 
     # Free worker lanes (0..c-1). User -c is the only limit — no hard max.
     slot_q: asyncio.Queue = asyncio.Queue()
