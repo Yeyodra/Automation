@@ -544,8 +544,8 @@ _in_flight_lock: asyncio.Lock | None = None
 _can_start: asyncio.Event | None = None
 _warp_drain_owner: int | None = None
 
-GIFT_CODE = _env("ENTER_GIFT_CODE", "CBAA2WH6DY")
-INVITER = _env("ENTER_INVITER", "Nazril Hanni")
+GIFT_CODE = _env("ENTER_GIFT_CODE", "1FTX6L1SFK")
+INVITER = _env("ENTER_INVITER", "Nazril Bintang")
 INVITEE_REWARD = _env("ENTER_INVITEE_REWARD", "100")
 
 API_KEY_NAME = _env("ENTER_API_KEY_NAME", "farm")
