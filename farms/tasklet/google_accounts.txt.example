@@ -1,0 +1,6 @@
+# Google accounts pool — one per line
+# Format: email:password  or  email|password
+# Lines starting with # are ignored
+#
+# example@gmail.com:MyP@ssw0rd
+# another@gmail.com|SecretPass123

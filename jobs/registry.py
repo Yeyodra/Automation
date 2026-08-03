@@ -53,6 +53,9 @@ _GROK = _job_cwd("grok", "AUTOMATION_GROK_FARM")
 _OUTLOOK = _job_cwd("outlook", "AUTOMATION_OUTLOOK_FARM")
 _ENTER = _job_cwd("enter", "AUTOMATION_ENTER_FARM")
 _GETUNIKEY = _job_cwd("getunikey", "AUTOMATION_GETUNIKEY_FARM")
+_FIRECRAWL = _job_cwd("firecrawl", "AUTOMATION_FIRECRAWL_FARM")
+_SCREENPIPE = _job_cwd("screenpipe", "AUTOMATION_SCREENPIPE_FARM")
+_TASKLET = _job_cwd("tasklet", "AUTOMATION_TASKLET_FARM")
 
 JOBS: dict[str, JobDef] = {
     "grok": JobDef(
@@ -131,6 +134,54 @@ JOBS: dict[str, JobDef] = {
         entry="farm.py",
         description="Alias of getunikey",
         env_prefix="GETUNIKEY_",
+    ),
+    "firecrawl": JobDef(
+        id="firecrawl",
+        name="firecrawl-farm",
+        cwd=_FIRECRAWL,
+        entry="farm.py",
+        description="Firecrawl Google-OAuth farmer — farms/firecrawl",
+        env_prefix="FIRECRAWL_",
+    ),
+    "firecrawl-farm": JobDef(
+        id="firecrawl",
+        name="firecrawl-farm",
+        cwd=_FIRECRAWL,
+        entry="farm.py",
+        description="Alias of firecrawl",
+        env_prefix="FIRECRAWL_",
+    ),
+    "screenpipe": JobDef(
+        id="screenpipe",
+        name="screenpipe-farm",
+        cwd=_SCREENPIPE,
+        entry="farm.py",
+        description="ScreenPipe Cloud token farmer — pure HTTP (Clerk + mail.tm)",
+        env_prefix="SCREENPIPE_",
+    ),
+    "screenpipe-farm": JobDef(
+        id="screenpipe",
+        name="screenpipe-farm",
+        cwd=_SCREENPIPE,
+        entry="farm.py",
+        description="Alias of screenpipe",
+        env_prefix="SCREENPIPE_",
+    ),
+    "tasklet": JobDef(
+        id="tasklet",
+        name="tasklet-farm",
+        cwd=_TASKLET,
+        entry="farm.py",
+        description="Tasklet magic-link farm — pure HTTP (exzork mailer)",
+        env_prefix="TASKLET_",
+    ),
+    "tasklet-farm": JobDef(
+        id="tasklet",
+        name="tasklet-farm",
+        cwd=_TASKLET,
+        entry="farm.py",
+        description="Alias of tasklet",
+        env_prefix="TASKLET_",
     ),
 }
 

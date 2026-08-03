@@ -468,21 +468,32 @@ class HubApp(App[None]):
         except Exception:
             pass
 
+    _GMAIL_LIST_JOBS = frozenset({"getunikey", "getunikey-farm", "firecrawl", "firecrawl-farm"})
+
     def _sync_getunikey_rows(self) -> None:
-        """Show Gmail list + referral URL for getunikey; hide -n (pool-sized)."""
-        is_guk = self._job_id() in ("getunikey", "getunikey-farm")
-        is_reauth = self._job_id() in ("grok-reauth", "grok_reauth")
-        for rid in ("#getunikey-row", "#getunikey-gmail-row"):
+        """Show Gmail list + referral URL for getunikey/firecrawl/tasklet; hide -n (pool-sized)."""
+        jid = self._job_id()
+        is_guk = jid in ("getunikey", "getunikey-farm")
+        is_fc = jid in ("firecrawl", "firecrawl-farm")
+        is_reauth = jid in ("grok-reauth", "grok_reauth")
+        show_gmail = is_guk or is_fc
+        for rid in ("#getunikey-gmail-row",):
             try:
-                self.query_one(rid, Horizontal).set_class(not is_guk, "hidden")
+                self.query_one(rid, Horizontal).set_class(not show_gmail, "hidden")
             except Exception:
                 pass
+        # Referral URL only for getunikey
+        try:
+            self.query_one("#getunikey-row", Horizontal).set_class(not is_guk, "hidden")
+        except Exception:
+            pass
         try:
             count_inp = self.query_one("#count", Input)
             count_lbl = self.query_one("#count-label", Label)
-            count_inp.disabled = is_guk
-            count_lbl.set_class(is_guk, "dim")
-            if is_guk:
+            pool_sized = is_guk or is_fc
+            count_inp.disabled = pool_sized
+            count_lbl.set_class(pool_sized, "dim")
+            if pool_sized:
                 count_inp.placeholder = "pool"
                 count_inp.value = "0"
             elif is_reauth:
@@ -772,12 +783,13 @@ class HubApp(App[None]):
         job = self.query_one("#job", Input).value.strip() or "grok"
         jlow = job.lower()
         is_guk = jlow in ("getunikey", "getunikey-farm")
+        is_fc = jlow in ("firecrawl", "firecrawl-farm")
         is_reauth = jlow in ("grok-reauth", "grok_reauth")
         try:
             c = max(1, int(self.query_one("#concurrent", Input).value.strip() or "1"))
         except ValueError:
             c = 1
-        if is_guk:
+        if is_guk or is_fc:
             gmails = self._parse_getunikey_gmail_list()
             n = max(1, len(gmails)) if gmails else 0
         elif is_reauth:
@@ -831,10 +843,13 @@ class HubApp(App[None]):
             if every_n > 0 and "--warp-every-n" not in " ".join(extra):
                 args.extend(["--warp-every-n", str(every_n)])
         elif is_guk:
-            # 0 = farm runs entire unused pool (size from GETUNIKEY_ACCOUNTS_LIST)
             if "-y" not in extra and "--yes" not in extra:
                 extra = ["-y", *extra]
             args = ["-n", "0", "-c", str(c), *extra]
+        elif is_fc:
+            if "-y" not in extra and "--yes" not in extra:
+                extra = ["-y", *extra]
+            args = ["-n", str(n), "-c", str(c), *extra]
         else:
             if "-y" not in extra and "--yes" not in extra:
                 extra = ["-y", *extra]
@@ -935,6 +950,18 @@ class HubApp(App[None]):
                     "[hub] referral empty — farm default "
                     "https://www.getunikey.ai/sign-up?aff=bTOY"
                 )
+        elif jlow in ("firecrawl", "firecrawl-farm"):
+            gmails = self._parse_getunikey_gmail_list()
+            if not gmails:
+                self._log("[hub] ERROR: Gmail list empty — paste email|password lines")
+                self._status("firecrawl: Gmail list required")
+                return
+            n = len(gmails)
+            accounts_file = Path(jdef.cwd) / "google_accounts.txt"
+            accounts_file.write_text(
+                "\n".join(gmails) + "\n", encoding="utf-8"
+            )
+            self._log(f"[hub] firecrawl Gmail list: {n} account(s) → {accounts_file.name}")
         # Jobs with warp_enabled=False (outlook): ignore form everyN / no auto-connect
         warp_ok = bool(getattr(jdef, "warp_enabled", True))
         if not warp_ok:

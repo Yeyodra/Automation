@@ -1,0 +1,7 @@
+# Google accounts pool for Firecrawl farm
+# One account per line: email:password or email|password
+# Lines starting with # are ignored
+#
+# Example:
+# user1@gmail.com:MyPassword123
+# user2@domain.com|AnotherPass456
