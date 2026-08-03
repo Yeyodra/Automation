@@ -47,7 +47,7 @@ try:
     from dotenv import load_dotenv
 
     # override=False so shell/CLI env can win over .env defaults
-    load_dotenv(_ROOT / ".env", override=False)
+    load_dotenv(_ROOT / ".env", override=True)
 except ImportError:
     env_path = _ROOT / ".env"
     if env_path.is_file():
@@ -500,8 +500,8 @@ IMAP_PORT = int(_env("ENTER_IMAP_PORT", "993") or "993")
 EMAIL_DOMAIN = _env("ENTER_EMAIL_DOMAIN").lstrip("@")
 # Default gptmail: Auth0 often blocks catch-all domains; IMAP not required.
 EMAIL_MODE = _env("ENTER_EMAIL_MODE", "gptmail").lower()
-# domain | plus_trick | tempmail (mail.tm) | gptmail (mail.chatgpt.org.uk — HAR 2026-07-17)
-if EMAIL_MODE not in ("plus_trick", "domain", "tempmail", "gptmail"):
+# domain | plus_trick | tempmail | gptmail | generator (generator.email)
+if EMAIL_MODE not in ("plus_trick", "domain", "tempmail", "gptmail", "generator"):
     EMAIL_MODE = "gptmail"
 GMAIL_BASE = _env("ENTER_GMAIL_BASE").lower() or IMAP_USER.lower()
 TEMPMAIL_API = _env("ENTER_TEMPMAIL_API", "https://api.mail.tm").rstrip("/")
@@ -544,8 +544,8 @@ _in_flight_lock: asyncio.Lock | None = None
 _can_start: asyncio.Event | None = None
 _warp_drain_owner: int | None = None
 
-GIFT_CODE = _env("ENTER_GIFT_CODE", "BI93YAM9CH")
-INVITER = _env("ENTER_INVITER", "nwwnjjanhh971")
+GIFT_CODE = _env("ENTER_GIFT_CODE", "CBAA2WH6DY")
+INVITER = _env("ENTER_INVITER", "Nazril Hanni")
 INVITEE_REWARD = _env("ENTER_INVITEE_REWARD", "100")
 
 API_KEY_NAME = _env("ENTER_API_KEY_NAME", "farm")
@@ -934,6 +934,210 @@ def _get_risk_session_id() -> str | None:
         return json.loads(resp.read())["data"]["risk_session_id"]
     except Exception:
         return None
+
+
+# ── BYCF Turnstile solver (pure HTTP, no browser) ───────────────────────────
+BYCF_URL = _env("ENTER_BYCF_URL", "https://shannz.zone.id/api")
+BYCF_SECRET = _env("ENTER_BYCF_SECRET", "shannz-secret-key-123")
+AUTH0_TURNSTILE_SITEKEY = "0x4AAAAAACwSuI5jPtwnNwc5"
+# AUTH_MODE: "browser" (default/current) or "http" (hybrid: HTTP Auth0 + browser GPTMail)
+AUTH_MODE = _env("ENTER_AUTH_MODE", "browser").lower()
+
+
+def _solve_turnstile_bycf(url: str, sitekey: str) -> str:
+    """Solve Cloudflare Turnstile via bycf remote service. Returns token string."""
+    body = json.dumps({"url": url, "siteKey": sitekey}).encode()
+    req = urllib.request.Request(
+        f"{BYCF_URL}/solve-turnstile-min",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-bycf-version": "1.0.5",
+            "x-bycf-secret": BYCF_SECRET,
+        },
+    )
+    resp = urllib.request.urlopen(req, timeout=60)
+    j = json.loads(resp.read())
+    if not j.get("success") or not j.get("data"):
+        raise RuntimeError(f"bycf turnstile failed: {j.get('error', j)}")
+    return j["data"]
+
+
+def _http_auth0_post_form(url: str, form_data: dict, cookies: str = "") -> tuple:
+    """POST form to Auth0 (no-follow redirect). Returns (status, location, body)."""
+    import http.client
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://converge-ai.us.auth0.com",
+    }
+    if cookies:
+        headers["Cookie"] = cookies
+    parsed = urlparse(url)
+    conn = http.client.HTTPSConnection(parsed.hostname, timeout=30)
+    path = parsed.path + ("?" + parsed.query if parsed.query else "")
+    conn.request("POST", path, body=urlencode(form_data).encode(), headers=headers)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    loc = dict(resp.getheaders()).get("Location", dict(resp.getheaders()).get("location", ""))
+    conn.close()
+    return resp.status, loc, body
+
+
+def _http_auth0_get(url: str, cookies: str = "") -> tuple:
+    """GET from Auth0 (no-follow). Returns (status, location, body)."""
+    import http.client
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,*/*",
+    }
+    if cookies:
+        headers["Cookie"] = cookies
+    parsed = urlparse(url)
+    conn = http.client.HTTPSConnection(parsed.hostname, timeout=30)
+    path = parsed.path + ("?" + parsed.query if parsed.query else "")
+    conn.request("GET", path, headers=headers)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    hdrs = dict(resp.getheaders())
+    loc = hdrs.get("Location", hdrs.get("location", ""))
+    # Parse set-cookie
+    raw_cookies = [v for k, v in resp.getheaders() if k.lower() == "set-cookie"]
+    conn.close()
+    return resp.status, loc, body, raw_cookies
+
+
+def do_signup_http(email_addr: str, password: str, attempt: int, otp_func) -> dict:
+    """Pure HTTP Auth0 signup. otp_func(email, timeout) returns OTP code string.
+
+    Returns same dict as exchange_code_for_tokens (access_token, refresh_token, etc).
+    """
+    alog(attempt, "http-auth: start")
+
+    # 1. Solve Turnstile
+    alog(attempt, "http-auth: solving turnstile (bycf)...")
+    ts_token = _solve_turnstile_bycf(
+        "https://converge-ai.us.auth0.com/u/signup/identifier",
+        AUTH0_TURNSTILE_SITEKEY,
+    )
+    alog(attempt, f"http-auth: turnstile ok (len={len(ts_token)})")
+
+    # 2. risk_session_id
+    rs_id = _get_risk_session_id()
+    alog(attempt, f"http-auth: risk_session={'ok' if rs_id else 'fail'}")
+
+    # 3. /authorize -> get state + cookies
+    import hashlib as _hl
+    verifier = secrets.token_urlsafe(32)
+    challenge = base64.urlsafe_b64encode(
+        _hl.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    our_state = secrets.token_urlsafe(16)
+
+    auth_params = urlencode({
+        "client_id": CLIENT_ID, "scope": SCOPE, "audience": AUDIENCE,
+        "redirect_uri": REDIRECT_URI, "response_type": "code", "response_mode": "query",
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": our_state,
+        "auth0Client": "eyJuYW1lIjoiYXV0aDAtcmVhY3QiLCJ2ZXJzaW9uIjoiMi4xMC4wIn0=",
+        "risk_session_id": rs_id or "", "screen_hint": "signup",
+    })
+    s3, loc3, _, raw_ck = _http_auth0_get(f"{AUTHORIZE_URL}?{auth_params}")
+    cookie_str = "; ".join(c.split(";")[0] for c in raw_ck if "=" in c.split(";")[0])
+    alog(attempt, f"http-auth: authorize {s3} -> {loc3[:50]}")
+
+    if not loc3:
+        raise RuntimeError(f"http-auth: no redirect from /authorize ({s3})")
+
+    # Follow to signup page
+    signup_url = f"https://auth.converge.ai{loc3}" if loc3.startswith("/") else loc3
+    _, _, body_su, _ = _http_auth0_get(signup_url, cookie_str)
+    m = re.search(r'name="state"\s+value="([^"]+)"', body_su)
+    auth0_state = m.group(1) if m else ""
+    if not auth0_state:
+        raise RuntimeError("http-auth: no state on signup page")
+
+    # 4. POST identifier
+    alog(attempt, "http-auth: POST identifier...")
+    form = {
+        "state": auth0_state, "email": email_addr, "captcha": ts_token,
+        "js-available": "true", "webauthn-available": "true",
+        "is-brave": "false", "webauthn-platform-available": "true", "action": "default",
+    }
+    s4, loc4, body4 = _http_auth0_post_form(
+        f"https://converge-ai.us.auth0.com/u/signup/identifier?state={auth0_state}",
+        form, cookie_str,
+    )
+    alog(attempt, f"http-auth: identifier {s4} -> {loc4[:60]}")
+
+    if "challenge" not in loc4 and s4 != 302:
+        err = re.search(r'data-error-code="([^"]+)"', body4)
+        err_code = err.group(1) if err else "unknown"
+        raise RuntimeError(f"http-auth: identifier rejected ({err_code})")
+
+    # 5. Get email challenge page
+    ch_url = f"https://converge-ai.us.auth0.com{loc4}" if loc4.startswith("/") else loc4
+    _, _, body_ch, _ = _http_auth0_get(ch_url, cookie_str)
+    ch_m = re.search(r'name="state"\s+value="([^"]+)"', body_ch)
+    ch_state = ch_m.group(1) if ch_m else auth0_state
+
+    # 6. Wait for OTP via callback
+    alog(attempt, "http-auth: waiting for OTP...")
+    otp = otp_func(email_addr, OTP_TIMEOUT_S)
+    if not otp:
+        raise RuntimeError("http-auth: OTP timeout")
+    alog(attempt, f"http-auth: OTP={otp}")
+
+    # 7. Submit OTP
+    s7, loc7, body7 = _http_auth0_post_form(
+        f"https://converge-ai.us.auth0.com/u/email-identifier/challenge?state={ch_state}",
+        {"state": ch_state, "code": otp, "action": "default"},
+        cookie_str,
+    )
+    alog(attempt, f"http-auth: OTP submit {s7} -> {loc7[:60]}")
+    if "risk_control_blocked" in body7 or "access_denied" in body7:
+        raise RuntimeError("http-auth: risk_control_blocked at OTP step")
+    if "password" not in loc7 and 'name="password"' not in body7:
+        err = re.search(r'data-error-code="([^"]+)"', body7)
+        raise RuntimeError(f"http-auth: OTP rejected ({err.group(1) if err else 'no password step'})")
+
+    # 8. Submit password
+    pass_state = ch_state
+    if loc7 and "password" in loc7:
+        pu = f"https://converge-ai.us.auth0.com{loc7}" if loc7.startswith("/") else loc7
+        _, _, pb, _ = _http_auth0_get(pu, cookie_str)
+        pm = re.search(r'name="state"\s+value="([^"]+)"', pb)
+        if pm:
+            pass_state = pm.group(1)
+
+    alog(attempt, "http-auth: POST password...")
+    s8, loc8, body8 = _http_auth0_post_form(
+        f"https://converge-ai.us.auth0.com/u/signup/password?state={pass_state}",
+        {"state": pass_state, "password": password, "action": "default"},
+        cookie_str,
+    )
+    alog(attempt, f"http-auth: password {s8} -> {loc8[:80]}")
+    if "risk_control_blocked" in body8 or "access_denied" in body8:
+        raise RuntimeError("http-auth: risk_control_blocked at password step")
+
+    # 9. Extract OAuth code
+    code = ""
+    if "code=" in loc8:
+        code = parse_qs(urlparse(loc8).query).get("code", [""])[0]
+    elif loc8:
+        fu = f"https://converge-ai.us.auth0.com{loc8}" if loc8.startswith("/") else loc8
+        _, locf, _, _ = _http_auth0_get(fu, cookie_str)
+        if "code=" in locf:
+            code = parse_qs(urlparse(locf).query).get("code", [""])[0]
+
+    if not code:
+        raise RuntimeError(f"http-auth: no OAuth code in final redirect")
+
+    # 10. Exchange code for tokens
+    alog(attempt, "http-auth: exchanging code...")
+    tokens = exchange_code_for_tokens(code, verifier)
+    alog(attempt, f"http-auth: SUCCESS (expires_in={tokens.get('expires_in')})")
+    return tokens
 
 
 # ── Proxy helpers (grok-farm compatible) ─────────────────────────────────────
@@ -1800,6 +2004,15 @@ async def generate_email(worker_slot: int | None = None) -> str:
                     _persist_used_email(key)
                     return addr
                 continue
+            if EMAIL_MODE == "generator":
+                from generator_email import create_inbox
+                addr = await asyncio.get_event_loop().run_in_executor(None, create_inbox)
+                key = addr.lower()
+                if key not in _used_emails:
+                    _used_emails.add(key)
+                    _persist_used_email(key)
+                    return addr
+                continue
             if EMAIL_MODE == "tempmail":
                 # create unique mail.tm inbox (API); no custom domain
                 loop = asyncio.get_event_loop()
@@ -2189,15 +2402,18 @@ async def wait_otp_imap_keepalive(
 
 
 async def wait_otp_imap(email_addr: str, since_ts: float | None = None, page=None, attempt: int = 0) -> str:
-    """Wait for OTP via IMAP (domain/plus), tempmail (mail.tm), or gptmail API."""
+    """Wait for OTP via IMAP, mail.tm, GPTMail, or generator.email."""
     since = since_ts if since_ts is not None else (time.time() - 45)
     loop = asyncio.get_event_loop()
 
-    if EMAIL_MODE in ("tempmail", "gptmail"):
-        poll_fn = (
-            read_otp_from_gptmail_sync if EMAIL_MODE == "gptmail" else read_otp_from_tempmail_sync
-        )
-        label = "GPTMAIL" if EMAIL_MODE == "gptmail" else "TEMPMAIL"
+    if EMAIL_MODE in ("tempmail", "gptmail", "generator"):
+        if EMAIL_MODE == "gptmail":
+            poll_fn, label = read_otp_from_gptmail_sync, "GPTMAIL"
+        elif EMAIL_MODE == "generator":
+            from generator_email import poll_otp
+            poll_fn, label = poll_otp, "GENERATOR"
+        else:
+            poll_fn, label = read_otp_from_tempmail_sync, "TEMPMAIL"
         fut = loop.run_in_executor(
             None,
             lambda: poll_fn(email_addr, OTP_TIMEOUT_S, since),
@@ -4280,6 +4496,43 @@ async def save_failed_to_file(attempt: int, email: str, err: str) -> None:
 async def _do_register_body(attempt: int, email_addr: str, password: str, proxy_url: str | None, proxy_id: str) -> dict:
     manager = None
     try:
+        # ── HTTP mode: skip browser for Auth0, use only for GPTMail ──
+        if AUTH_MODE == "http":
+            alog(attempt, "mode=http (no browser for Auth0)")
+
+            def _otp_sync(email, timeout):
+                return read_otp_from_gptmail_sync(email, timeout=timeout, since_ts=time.time())
+
+            tokens = do_signup_http(email_addr, password, attempt, _otp_sync)
+            enter_meta = enter_post_auth_setup(tokens["access_token"], GIFT_CODE)
+            api_data = (enter_meta.get("api_key") or {}).get("data") or {}
+            alog(attempt, f"API key created name={api_data.get('name')} id={api_data.get('id')} key={(api_data.get('key') or '')[:12]}...")
+            return {
+                "email": email_addr,
+                "password": password,
+                "gift_code": GIFT_CODE,
+                "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "attempt": attempt,
+                "proxy": proxy_url or "direct",
+                "workspace_id": enter_meta.get("workspace_id"),
+                "tokens": {
+                    "access_token": tokens.get("access_token"),
+                    "refresh_token": tokens.get("refresh_token"),
+                    "expires_at": tokens.get("expires_at"),
+                    "expires_in": tokens.get("expires_in"),
+                    "scope": tokens.get("scope"),
+                },
+                "api_key": {
+                    "id": api_data.get("id"),
+                    "name": api_data.get("name"),
+                    "key": api_data.get("key"),
+                    "scope": api_data.get("scope"),
+                    "reveal_policy": api_data.get("reveal_policy"),
+                },
+                "enter": enter_meta,
+            }
+
+        # ── Browser mode (default/current) ──
         manager, browser, page = await launch_browser(proxy_url)
         _plog = "direct"
         if proxy_url:
@@ -4342,7 +4595,7 @@ async def register_one_account(
         await _wait_rate_limit_window(attempt)
         password = ACCOUNT_PASSWORD
         proxy_url, proxy_id = await next_proxy()
-        domain_tries = GPTMAIL_DOMAIN_RETRIES if EMAIL_MODE == "gptmail" else 1
+        domain_tries = GPTMAIL_DOMAIN_RETRIES if EMAIL_MODE in ("gptmail", "generator") else 1
         last_msg = ""
         for dom_try in range(1, domain_tries + 1):
             email_addr = await generate_email(worker_slot=worker_slot)
@@ -4381,7 +4634,7 @@ async def register_one_account(
                 # Track per-domain fails (auto-blacklist after threshold)
                 if not nav_fail:
                     _domain_fail_track(email_addr, msg[:120], worker_slot=worker_slot)
-                is_domain_block = EMAIL_MODE == "gptmail" and (
+                is_domain_block = EMAIL_MODE in ("gptmail", "generator") and (
                     "domain_not_allowed" in low
                     or "domain is not allowed" in low
                     or "email domain is not allowed" in low
@@ -4482,6 +4735,8 @@ async def main() -> None:
         except Exception as e:
             print(f"ERROR: gptmail domains unreachable: {e}", flush=True)
             sys.exit(1)
+    elif EMAIL_MODE == "generator":
+        print("[CFG] email_mode=generator api=https://generator.email", flush=True)
     elif EMAIL_MODE == "tempmail":
         slog("CFG", f"email_mode=tempmail provider={TEMPMAIL_PROVIDER} api={TEMPMAIL_API}")
     else:
@@ -4530,6 +4785,8 @@ async def main() -> None:
     _dom_label = EMAIL_DOMAIN or GMAIL_BASE
     if EMAIL_MODE == "gptmail":
         _dom_label = GPTMAIL_DOMAIN or "auto"
+    elif EMAIL_MODE == "generator":
+        _dom_label = "generator.email/auto"
     elif EMAIL_MODE == "tempmail":
         _dom_label = TEMPMAIL_API
     slog(

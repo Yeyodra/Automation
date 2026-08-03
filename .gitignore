@@ -27,3 +27,8 @@ farms/**/*.log
 **/.env.local-backup
 **/tmp_*
 backups/
+
+# Farm runtime/debug artifacts
+farms/*/*.bak.*
+farms/*/proxies.*.txt
+farms/*/*blocked_domains*.txt
