@@ -1,4 +1,4 @@
-"""Batch-push reauth credentials to VPS 9router DB (merge by email, not full file).
+"""Batch-push reauth credentials directly to the VPS NvRouter SQLite DB.
 
 Default: every 10 OK → SSH + node vps_upsert_credentials.js on VPS.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 _ROOT = Path(__file__).resolve().parent
-UPSERT_SCRIPT_NAME = "vps_upsert_credentials.js"
+UPSERT_SCRIPT_NAME = "vps_import_credentials.py"
 DEFAULT_EVERY = 10
 
 
@@ -104,7 +104,7 @@ class VpsBatchPusher:
         self.port = port or int(_env("VPS_PORT") or _env("GROK_VPS_PORT") or "22" or "22")
         self.remote_upsert = remote_upsert or _env(
             "GROK_VPS_UPSERT",
-            "/home/ubuntu/scripts/grok-refresh/vps_upsert_credentials.js",
+            "/home/ubuntu/scripts/grok-refresh/vps_import_credentials.py",
         )
         self.log = log or (lambda m: print(m, flush=True))
         self.enabled = bool(enabled and self.host and self.user)
@@ -242,12 +242,7 @@ class VpsBatchPusher:
             finally:
                 sftp.close()
 
-            cmd = (
-                "export PATH=/usr/local/bin:$PATH; "
-                "export NINEROUTER_DB=/home/ubuntu/.9router/db/data.sqlite; "
-                "export NINEROUTER_SQLITE=/home/ubuntu/scripts/grok-refresh/node_modules/better-sqlite3; "
-                f"/usr/local/bin/node {self.remote_upsert}"
-            )
+            cmd = f"/usr/bin/python3 {self.remote_upsert}"
             stdin, stdout, stderr = client.exec_command(cmd, timeout=120)
             stdin.write(payload)
             stdin.channel.shutdown_write()
