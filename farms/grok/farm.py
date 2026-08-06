@@ -1860,7 +1860,7 @@ def _cookie_header_from_playwright(cookies: list[dict]) -> str:
     return "; ".join(f"{k}={v}" for k, v in seen.items())
 
 
-async def try_device_approval_http(page, user_code: str, attempt: int) -> tuple[bool, str]:
+async def try_device_approval_http(page, user_code: str) -> tuple[bool, str]:
     """Approve device OAuth through the browser request context; UI remains fallback."""
     try:
         cookies = await page.context.cookies()
@@ -1893,10 +1893,13 @@ async def try_device_approval_http(page, user_code: str, attempt: int) -> tuple[
                 },
             )
             status = response.status
-            details.append(f"{url.rsplit('/', 1)[-1]}:{status}")
+            final_url = response.url
+            endpoint = url.rsplit("/", 1)[-1]
+            details.append(f"{endpoint}:{status}")
             if status >= 400:
-                body = (await response.text())[:120]
-                return False, f"{url} HTTP {status} {body}"
+                return False, f"{endpoint} HTTP {status}"
+            if final_url != url:
+                return False, f"{endpoint} unexpected final URL: {final_url}"
         except Exception as e:
             return False, f"{url} err={e}"
     return True, " | ".join(details)
@@ -3663,7 +3666,7 @@ async def obtain_oidc_tokens(page, email_addr: str, password: str, attempt: int)
             # A retry means HTTP looked successful but token polling rejected it; force the
             # proven browser path instead of repeating the same false-positive response.
             if oauth_try == 1:
-                approved, http_detail = await try_device_approval_http(page, user_code, attempt)
+                approved, http_detail = await try_device_approval_http(page, user_code)
             else:
                 approved, http_detail = False, "retry forced to browser fallback"
             print(
@@ -3731,6 +3734,16 @@ async def obtain_oidc_tokens(page, email_addr: str, password: str, attempt: int)
                     await asyncio.sleep(1.0 if clicked else 1.2)
 
                 await screenshot(page, attempt, "device_oauth")
+
+                # UI may establish session/Turnstile prerequisites that the first HTTP
+                # attempt lacked. Retry verify+approve before polling, as in the proven flow.
+                ui_approved = approved
+                approved, http_detail = await try_device_approval_http(page, user_code)
+                print(
+                    f"[{attempt}] device HTTP after UI ok={approved} {http_detail}",
+                    flush=True,
+                )
+                approved = approved or ui_approved
 
             if approved:
                 await asyncio.sleep(2.0)

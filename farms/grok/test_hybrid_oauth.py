@@ -8,7 +8,9 @@ from pathlib import Path
 
 class _Response:
     status = 200
-    url = "https://auth.x.ai/oauth2/device/approve"
+
+    def __init__(self, url="https://auth.x.ai/oauth2/device/approve"):
+        self.url = url
 
     async def text(self):
         return "approved"
@@ -20,7 +22,7 @@ class _Request:
 
     async def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return _Response()
+        return _Response(url)
 
 
 class _Context:
@@ -52,7 +54,7 @@ class DeviceHttpApprovalTests(unittest.TestCase):
     def test_http_device_approval_uses_browser_request_context(self):
         page = _Page()
         ok, detail = asyncio.run(
-            self.farm.try_device_approval_http(page, "ABCD-EFGH", 1)
+            self.farm.try_device_approval_http(page, "ABCD-EFGH")
         )
 
         self.assertTrue(ok)
@@ -66,6 +68,23 @@ class DeviceHttpApprovalTests(unittest.TestCase):
             page.context.request.calls[0][1]["form"], {"user_code": "ABCD-EFGH"}
         )
 
+    def test_http_device_approval_rejects_redirected_login_page(self):
+        class LoginResponse(_Response):
+            def __init__(self):
+                super().__init__("https://accounts.x.ai/sign-in")
+
+        page = _Page()
+
+        async def post(*args, **kwargs):
+            return LoginResponse()
+
+        page.context.request.post = post
+        ok, detail = asyncio.run(
+            self.farm.try_device_approval_http(page, "ABCD-EFGH")
+        )
+        self.assertFalse(ok)
+        self.assertIn("unexpected final URL", detail)
+
     def test_http_device_approval_falls_back_when_cookies_missing(self):
         class EmptyContext:
             async def cookies(self):
@@ -75,7 +94,7 @@ class DeviceHttpApprovalTests(unittest.TestCase):
             context = EmptyContext()
 
         ok, detail = asyncio.run(
-            self.farm.try_device_approval_http(EmptyPage(), "ABCD-EFGH", 1)
+            self.farm.try_device_approval_http(EmptyPage(), "ABCD-EFGH")
         )
         self.assertFalse(ok)
         self.assertEqual(detail, "no x.ai cookies")
