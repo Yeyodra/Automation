@@ -1860,19 +1860,16 @@ def _cookie_header_from_playwright(cookies: list[dict]) -> str:
     return "; ".join(f"{k}={v}" for k, v in seen.items())
 
 
-def device_verify_and_approve_http(user_code: str, cookie_header: str) -> tuple[bool, str]:
-    """POST device/verify + device/approve (grok2api SSO path). Returns (ok, detail)."""
-    if not user_code or not cookie_header:
-        return False, "missing user_code or cookies"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "text/html,application/json,*/*",
-        "User-Agent": "grok-farm/device-oauth",
-        "Cookie": cookie_header,
-        "Origin": "https://accounts.x.ai",
-        "Referer": "https://accounts.x.ai/",
-    }
-    detail_parts: list[str] = []
+async def try_device_approval_http(page, user_code: str, attempt: int) -> tuple[bool, str]:
+    """Approve device OAuth through the browser request context; UI remains fallback."""
+    try:
+        cookies = await page.context.cookies()
+    except Exception as e:
+        return False, f"cookie read failed: {e}"
+    if not _cookie_header_from_playwright(cookies):
+        return False, "no x.ai cookies"
+
+    details: list[str] = []
     for url, form in (
         (XAI_DEVICE_VERIFY, {"user_code": user_code}),
         (
@@ -1885,23 +1882,24 @@ def device_verify_and_approve_http(user_code: str, cookie_header: str) -> tuple[
             },
         ),
     ):
-        body = urlencode(form).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = resp.status
-                final = resp.geturl()
-                raw = resp.read(512).decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            status = e.code
-            final = e.geturl() if hasattr(e, "geturl") else url
-            raw = e.read(512).decode("utf-8", "replace")
+            response = await page.context.request.post(
+                url,
+                form=form,
+                headers={
+                    "Accept": "text/html,application/json,*/*",
+                    "Origin": "https://accounts.x.ai",
+                    "Referer": "https://accounts.x.ai/",
+                },
+            )
+            status = response.status
+            details.append(f"{url.rsplit('/', 1)[-1]}:{status}")
+            if status >= 400:
+                body = (await response.text())[:120]
+                return False, f"{url} HTTP {status} {body}"
         except Exception as e:
             return False, f"{url} err={e}"
-        detail_parts.append(f"{url.split('/')[-1]}:{status}:{final[-60:]}")
-        if status >= 400:
-            return False, f"{url} HTTP {status} {raw[:120]}"
-    return True, " | ".join(detail_parts)
+    return True, " | ".join(details)
 
 
 def poll_device_code(
@@ -3660,86 +3658,79 @@ async def obtain_oidc_tokens(page, email_addr: str, password: str, attempt: int)
                 flush=True,
             )
 
-            # Navigate + consent FIRST, then poll (avoids early invalid_grant race)
-            await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
-            await asyncio.sleep(1.0)
-            await dismiss_cookie_banner(page)
-            await recover_page_load_error(page, attempt)
-            await handle_turnstile(page, attempt, max_wait=12)
+            # Fast path: the browser request context shares its authenticated cookie jar
+            # and proxy, so Device OAuth can finish over HTTP without opening consent UI.
+            # A retry means HTTP looked successful but token polling rejected it; force the
+            # proven browser path instead of repeating the same false-positive response.
+            if oauth_try == 1:
+                approved, http_detail = await try_device_approval_http(page, user_code, attempt)
+            else:
+                approved, http_detail = False, "retry forced to browser fallback"
+            print(
+                f"[{attempt}] device HTTP approve ok={approved} {http_detail}",
+                flush=True,
+            )
 
-            if await page.locator('input[type="email"], input[type="password"]').count() > 0:
-                await click_login_with_email(page)
-                await asyncio.sleep(0.3)
-                await drive_email_password_login(page, email_addr, password, attempt)
-                await asyncio.sleep(0.6)
+            # Browser fallback keeps the proven anti-bot/login path when HTTP is rejected.
+            if not approved:
                 await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
                 await asyncio.sleep(1.0)
+                await dismiss_cookie_banner(page)
+                await recover_page_load_error(page, attempt)
+                await handle_turnstile(page, attempt, max_wait=12)
 
-            approved = False
-            for _ in range(12):
-                await handle_turnstile(page, attempt, max_wait=6)
-                body = ""
-                try:
-                    body = (await page.inner_text("body"))[:800].lower()
-                except Exception:
-                    pass
-                if any(
-                    x in body
-                    for x in (
-                        "success",
-                        "approved",
-                        "you can close",
-                        "return to",
-                        "device authorized",
-                        "authorization complete",
-                        "already authorized",
+                if await page.locator('input[type="email"], input[type="password"]').count() > 0:
+                    await click_login_with_email(page)
+                    await asyncio.sleep(0.3)
+                    await drive_email_password_login(page, email_addr, password, attempt)
+                    await asyncio.sleep(0.6)
+                    await page.goto(verify, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(1.0)
+
+                for _ in range(12):
+                    await handle_turnstile(page, attempt, max_wait=6)
+                    body = ""
+                    try:
+                        body = (await page.inner_text("body"))[:800].lower()
+                    except Exception:
+                        pass
+                    if any(
+                        x in body
+                        for x in (
+                            "success",
+                            "approved",
+                            "you can close",
+                            "return to",
+                            "device authorized",
+                            "authorization complete",
+                            "already authorized",
+                        )
+                    ):
+                        print(f"[{attempt}] device page looks approved", flush=True)
+                        approved = True
+                        break
+                    if "failed to generate" in body or "access denied" in body:
+                        print(
+                            f"[{attempt}] WARN device page text: access denied / failed generate",
+                            flush=True,
+                        )
+                    clicked = await click_text_button(
+                        page,
+                        [
+                            "Continue",
+                            "Allow",
+                            "Authorize",
+                            "Approve",
+                            "Confirm",
+                            "Yes",
+                            "Accept",
+                            "Next",
+                        ],
+                        exclude=["Google", "Deny", "Cancel", "Sign out"],
                     )
-                ):
-                    print(f"[{attempt}] device page looks approved", flush=True)
-                    approved = True
-                    break
-                if "failed to generate" in body or "access denied" in body:
-                    print(
-                        f"[{attempt}] WARN device page text: access denied / failed generate",
-                        flush=True,
-                    )
-                clicked = await click_text_button(
-                    page,
-                    [
-                        "Continue",
-                        "Allow",
-                        "Authorize",
-                        "Approve",
-                        "Confirm",
-                        "Yes",
-                        "Accept",
-                        "Next",
-                    ],
-                    exclude=["Google", "Deny", "Cancel", "Sign out"],
-                )
-                await asyncio.sleep(1.0 if clicked else 1.2)
+                    await asyncio.sleep(1.0 if clicked else 1.2)
 
-            await screenshot(page, attempt, "device_oauth")
-
-            # Explicit HTTP verify+approve (grok2api) — UI "Device Authorized"
-            # alone often still yields invalid_grant on token poll.
-            try:
-                cookies = await page.context.cookies()
-            except Exception:
-                cookies = []
-            cookie_hdr = _cookie_header_from_playwright(cookies)
-            if cookie_hdr:
-                ok_http, http_detail = await asyncio.to_thread(
-                    device_verify_and_approve_http, user_code, cookie_hdr
-                )
-                print(
-                    f"[{attempt}] device HTTP approve ok={ok_http} {http_detail}",
-                    flush=True,
-                )
-                if ok_http:
-                    approved = True
-            else:
-                print(f"[{attempt}] WARN no x.ai cookies for HTTP approve", flush=True)
+                await screenshot(page, attempt, "device_oauth")
 
             if approved:
                 await asyncio.sleep(2.0)
