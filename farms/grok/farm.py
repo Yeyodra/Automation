@@ -4360,7 +4360,7 @@ async def main():
         concurrent = arg_conc if arg_conc is not None else CONCURRENT
     else:
         max_accounts = arg_count if arg_count is not None else _prompt_int(
-            "Berapa akun yang mau di-farm (batch ini)?", MAX_ACCOUNTS, min_v=1, max_v=1000
+            "Berapa akun yang mau di-farm (batch ini)?", MAX_ACCOUNTS, min_v=1, max_v=1_000_000
         )
         concurrent = arg_conc if arg_conc is not None else _prompt_int(
             "Concurrency (browser paralel)?", CONCURRENT, min_v=1, max_v=20
@@ -4369,7 +4369,7 @@ async def main():
             print("  Dibatalkan.", flush=True)
             sys.exit(0)
 
-    max_accounts = max(1, min(1000, int(max_accounts)))
+    max_accounts = max(1, int(max_accounts))
     concurrent = max(1, min(20, int(concurrent)))
     # Keep module CONCURRENT in sync so WARP everyN 1:1 uses live -c
     CONCURRENT = concurrent
