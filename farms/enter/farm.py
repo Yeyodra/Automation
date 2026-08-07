@@ -3916,11 +3916,7 @@ def _is_gateway_callback_status(status: int) -> bool:
 
 
 def _is_enter_app_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.hostname == urlparse(APP_HOST).hostname and parsed.path == "/"
-    except Exception:
-        return False
+    return _is_enter_url(url, "/")
 
 
 def _parse_gateway_session(status: int, body: str) -> dict:

@@ -74,6 +74,8 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
         self.assertTrue(self.farm._is_enter_app_url("https://enter.converge.ai/?inviteCode=x"))
         self.assertFalse(self.farm._is_enter_app_url("https://enter.converge.ai/auth/callback?code=x"))
         self.assertFalse(self.farm._is_enter_app_url("https://auth.converge.ai/"))
+        self.assertFalse(self.farm._is_enter_app_url("http://enter.converge.ai/"))
+        self.assertFalse(self.farm._is_enter_app_url("https://enter.converge.ai:444/"))
 
     def test_callback_requires_completed_redirect_response(self):
         self.assertTrue(self.farm._is_gateway_callback_status(302))
