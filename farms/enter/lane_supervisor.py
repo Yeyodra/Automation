@@ -485,12 +485,13 @@ def main() -> None:
         }
         write_private_json(state_file, state)
         print(json.dumps(state), flush=True)
-        # Post-OK velocity cooldown: Auth0/Enter denies signups <115s after a
-        # successful signup from the same referral/proxy identity. min_reuse
-        # (default 120s) is the proven safe inter-signup gap (handoff: 2/2 OK).
+        # Post-OK velocity cooldown: Auth0/Enter denies signups within a
+        # velocity window after a successful signup from the same identity.
+        # 120s post-OK still denied at 167s (Lane A). 226s gap was OK (Lane B).
+        # Safe post-OK gap: 200s (+ ~45s attempt = ~245s inter-signup).
         post_sleep = args.gap
         if category == "ok":
-            post_sleep = max(args.gap, args.min_reuse)
+            post_sleep = max(args.gap, 200)
         time.sleep(post_sleep)
 
 
