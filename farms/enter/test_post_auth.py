@@ -224,6 +224,16 @@ class PostAuthSetupTests(unittest.TestCase):
              ]):
             self.assertEqual(self.farm.create_emailqu_inbox(), "canary1@known-good.test")
 
+    def test_emailqu_custom_prefix_uses_unique_local_part_without_username_api(self):
+        with patch.object(self.farm, "EMAILQU_PREFIX", "nazril"), \
+             patch.object(self.farm, "EMAILQU_DOMAIN", "known-good.test"), \
+             patch.object(self.farm, "_crypto_local_part", return_value="abcdefghij"), \
+             patch.object(self.farm, "_emailqu_apex_domains", return_value=["known-good.test"]), \
+             patch.object(self.farm, "_emailqu_get", return_value=(200, {"verified": True}, "")) as get:
+            self.assertEqual(self.farm.create_emailqu_inbox(), "nazrilabcdefghij@known-good.test")
+        self.assertEqual(get.call_count, 1)
+        self.assertIn("/api/domain/verify/", get.call_args.args[0])
+
     def test_emailqu_pin_must_still_be_a_public_apex_domain(self):
         self.farm.EMAILQU_DOMAIN = "sub.example.test"
         with patch.object(self.farm, "_emailqu_apex_domains", return_value=["example.test"]), \

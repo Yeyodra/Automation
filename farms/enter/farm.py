@@ -526,6 +526,7 @@ EXZORK_DOMAIN = _env("ENTER_EXZORK_DOMAIN", _env("EXZORK_DOMAIN")).lstrip("@").l
 EXZORK_WILDCARD = _env_bool("ENTER_EXZORK_WILDCARD", True)
 EMAILQU_API = _env("ENTER_EMAILQU_API", "https://emailqu.com").rstrip("/")
 EMAILQU_DOMAIN = _env("ENTER_EMAILQU_DOMAIN").lstrip("@").lower()
+EMAILQU_PREFIX = re.sub(r"[^a-z0-9]", "", _env("ENTER_EMAILQU_PREFIX").lower())[:24]
 CAMOUFOX_OS = _env("ENTER_BROWSER_OS", "linux").lower()
 BROWSER_ENGINE = _env("ENTER_BROWSER_ENGINE", "camoufox").lower()
 BROWSER_EXECUTABLE = _env("ENTER_BROWSER_EXECUTABLE")
@@ -2319,10 +2320,13 @@ def _emailqu_apex_domains() -> list[str]:
 
 
 def create_emailqu_inbox() -> str:
-    _, data, _ = _emailqu_get("/api/random-username")
-    username = re.sub(r"[^a-z0-9]", "", str(data.get("username") or "").lower())
-    if not username:
-        raise RuntimeError("emailqu: random username missing")
+    if EMAILQU_PREFIX:
+        username = EMAILQU_PREFIX + _crypto_local_part(10)
+    else:
+        _, data, _ = _emailqu_get("/api/random-username")
+        username = re.sub(r"[^a-z0-9]", "", str(data.get("username") or "").lower())
+        if not username:
+            raise RuntimeError("emailqu: random username missing")
     domains = _emailqu_apex_domains()
     if EMAILQU_DOMAIN and EMAILQU_DOMAIN not in domains:
         raise RuntimeError("emailqu: pinned domain is not a public apex domain")
