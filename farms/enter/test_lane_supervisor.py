@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 from farms.enter.lane_supervisor import (
     FARM_RESULTS_SENTINEL,
     classify_outcome,
+    global_start_wait,
     load_scheduler_state,
     normalize_domains,
     outcome_cooldown_seconds,
@@ -154,6 +155,13 @@ class LaneSupervisorTests(unittest.TestCase):
             parse_blocked_domains("bad.test # explicit rejection\nother.test reason text\n"),
             {"bad.test", "other.test"},
         )
+
+    def test_global_start_gate_calculates_cross_lane_wait_atomically(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "global-start.lock"
+            self.assertEqual(global_start_wait(path, 75, now=1000), 0)
+            self.assertEqual(global_start_wait(path, 75, now=1030), 45)
+            self.assertEqual(global_start_wait(path, 75, now=1075), 0)
 
     def test_rate_limit_uses_short_contextual_cooldown(self):
         self.assertEqual(outcome_cooldown_seconds("rate_limited", 900, 120), 120)

@@ -2,6 +2,7 @@
 """Run one serial Enter lane with domain rotation and strict block attribution."""
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -159,6 +160,30 @@ def select_contextual_domain(queue: list[str], cooldowns: dict[str, float],
     return selected
 
 
+def global_start_wait(path: Path, gap: int, now: float | None = None) -> int:
+    if gap <= 0:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    current = time.time() if now is None else now
+    with path.open("a+", encoding="utf-8") as handle:
+        path.chmod(0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        try:
+            previous = float(handle.read().strip() or 0)
+        except ValueError:
+            previous = 0
+        wait = max(0, int(previous + gap - current + 0.999))
+        if wait == 0:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(current))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return wait
+
+
 def outcome_cooldown_seconds(category: str, ambiguous: int, min_reuse: int) -> int:
     if category == "ok":
         return 0
@@ -259,6 +284,7 @@ def main() -> None:
     parser.add_argument("--cooldown", type=int, default=900)
     parser.add_argument("--min-reuse", type=int, default=120)
     parser.add_argument("--explore-every", type=int, default=5)
+    parser.add_argument("--global-start-gap", type=int, default=0)
     args = parser.parse_args()
 
     blocked_file = resolve_blocked_file(os.environ)
@@ -296,6 +322,12 @@ def main() -> None:
             time.sleep(max(30, int(min(wakeups, default=now + 60) - now)))
             continue
         last_used[domain] = now
+        start_gate = runtime_dir / "global-start.lock"
+        while True:
+            wait = global_start_wait(start_gate, max(0, args.global_start_gap))
+            if not wait:
+                break
+            time.sleep(wait)
         terminal_file = runtime_dir / f"terminal-{lane}-{time.time_ns()}.json"
         env = os.environ.copy()
         env.update({
