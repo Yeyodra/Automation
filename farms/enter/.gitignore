@@ -6,4 +6,5 @@ results/
 screenshots/
 logs/
 *.log
+lane-*-state.json
 .DS_Store
