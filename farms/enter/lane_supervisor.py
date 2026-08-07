@@ -180,19 +180,29 @@ def trip_shared_heat(path: Path, cooldown: int, now: float | None = None) -> Non
         lock_path.chmod(0o600)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         level = 0
-        last_denial = 0.0
+        last_wave = 0.0
+        pending_denial = 0.0
+        until = 0.0
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 level = int(data.get("level", 0))
-                last_denial = float(data.get("last_denial", 0))
+                last_wave = float(data.get("last_wave", 0))
+                pending_denial = float(data.get("pending_denial", 0))
+                until = float(data.get("until", 0))
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
-        level = min(3, level + 1) if current - last_denial < 1800 else 1
+        if current - pending_denial > 60:
+            write_private_json(path, {
+                "version": 1, "level": level, "last_wave": last_wave,
+                "pending_denial": current, "until": until,
+            })
+            return
+        level = min(3, level + 1) if current - last_wave < 1800 else 1
         duration = min(1800, cooldown * (2 ** (level - 1)))
         write_private_json(path, {
-            "version": 1, "level": level, "last_denial": current,
-            "until": current + duration,
+            "version": 1, "level": level, "last_wave": current,
+            "pending_denial": 0, "until": current + duration,
         })
 
 

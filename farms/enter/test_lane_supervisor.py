@@ -164,10 +164,13 @@ class LaneSupervisorTests(unittest.TestCase):
             path = Path(directory) / "shared-heat.json"
             self.assertEqual(shared_heat_wait(path, now=1000), 0)
             trip_shared_heat(path, 300, now=1000)
-            self.assertEqual(shared_heat_wait(path, now=1100), 200)
-            trip_shared_heat(path, 300, now=1301)
-            self.assertEqual(shared_heat_wait(path, now=1301), 600)
-            self.assertEqual(shared_heat_wait(path, now=1902), 0)
+            self.assertEqual(shared_heat_wait(path, now=1010), 0)
+            trip_shared_heat(path, 300, now=1030)
+            self.assertEqual(shared_heat_wait(path, now=1100), 230)
+            trip_shared_heat(path, 300, now=1331)
+            self.assertEqual(shared_heat_wait(path, now=1335), 0)
+            trip_shared_heat(path, 300, now=1340)
+            self.assertEqual(shared_heat_wait(path, now=1340), 600)
 
     def test_cross_lane_domain_lease_prevents_identity_collision(self):
         with TemporaryDirectory() as directory:
