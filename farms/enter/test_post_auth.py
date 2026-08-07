@@ -315,6 +315,27 @@ class PostAuthSetupTests(unittest.TestCase):
             self.assertEqual(self.farm._emailqu_get("/api/random-username"), (200, {"success": True}, "v1"))
         self.assertEqual(get.call_args.kwargs["proxies"]["https"], "socks5h://127.0.0.1:40001")
 
+    def test_low_bandwidth_policy_only_blocks_known_decorative_assets(self):
+        blocked = (
+            ("https://enter.converge.ai/_enter_home/images/product-card-code.png", "image"),
+            ("https://pub-example.r2.dev/public/enter-bg.png", "image"),
+            ("https://cdn.enter.pro/admin_resources/promo-messages/banner.png", "image"),
+        )
+        allowed = (
+            ("https://enter.converge.ai/_enter_home/_next/static/chunks/app.js", "script"),
+            ("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/orchestrate/managed/v1", "image"),
+            ("https://fpjs.converge.ai/", "xhr"),
+            ("https://auth.converge.ai/u/signup/identifier", "document"),
+            ("https://api.enter.pro/code/api/v1/auth/risk-session", "fetch"),
+            ("https://enter.converge.ai/favicon.ico", "image"),
+        )
+        for url, resource_type in blocked:
+            with self.subTest(url=url):
+                self.assertTrue(self.farm._is_decorative_asset(url, resource_type))
+        for url, resource_type in allowed:
+            with self.subTest(url=url):
+                self.assertFalse(self.farm._is_decorative_asset(url, resource_type))
+
     def test_real_chrome_backend_is_opt_in_and_uses_isolated_context(self):
         source = inspect.getsource(self.farm.launch_browser)
         self.assertIn('BROWSER_ENGINE == "chrome"', source)

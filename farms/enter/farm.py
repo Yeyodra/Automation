@@ -531,6 +531,7 @@ EMAILQU_PREFIX = re.sub(r"[^a-z0-9]", "", _env("ENTER_EMAILQU_PREFIX").lower())[
 CAMOUFOX_OS = _env("ENTER_BROWSER_OS", "linux").lower()
 BROWSER_ENGINE = _env("ENTER_BROWSER_ENGINE", "camoufox").lower()
 BROWSER_EXECUTABLE = _env("ENTER_BROWSER_EXECUTABLE")
+LOW_BANDWIDTH = _env_bool("ENTER_LOW_BANDWIDTH", False)
 MANUAL_TURNSTILE = _env_bool("ENTER_MANUAL_TURNSTILE", False)
 ACCOUNT_PASSWORD = _env("ENTER_PASSWORD", "@EnterPass1")
 MAX_ACCOUNTS = int(_env("ENTER_MAX_ACCOUNTS", "1") or "1")
@@ -3395,6 +3396,35 @@ async def goto_with_retry(
     ) from last
 
 
+def _is_decorative_asset(url: str, resource_type: str) -> bool:
+    """Block only measured visual payloads; never auth/risk/challenge traffic."""
+    if resource_type not in {"image", "media"}:
+        return False
+    parsed = urlparse(url)
+    host, path = parsed.hostname or "", parsed.path.lower()
+    if host in {"challenges.cloudflare.com", "fpjs.converge.ai", "auth.converge.ai", "api.enter.pro"}:
+        return False
+    return (
+        host == "enter.converge.ai" and path.startswith("/_enter_home/images/product-card-")
+        or host.endswith(".r2.dev") and path == "/public/enter-bg.png"
+        or host == "cdn.enter.pro" and (
+            path.startswith("/admin_resources/promo-messages/")
+            or path.startswith("/resources/public/cover_")
+        )
+    )
+
+
+async def _enable_low_bandwidth(page) -> None:
+    async def route_request(route):
+        request = route.request
+        if _is_decorative_asset(request.url, request.resource_type):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await page.route("**/*", route_request)
+
+
 async def launch_browser(proxy_url: str | None):
     if BROWSER_ENGINE == "chrome":
         from playwright.async_api import async_playwright
@@ -3408,6 +3438,8 @@ async def launch_browser(proxy_url: str | None):
             launch["proxy"] = _parse_proxy(proxy_url)
         browser = await playwright.chromium.launch(**launch)
         page = await browser.new_page(locale="en-US")
+        if LOW_BANDWIDTH:
+            await _enable_low_bandwidth(page)
         page.set_default_timeout(max(60000, GOTO_TIMEOUT_MS + 15000))
         return manager, browser, page
 
@@ -3424,6 +3456,8 @@ async def launch_browser(proxy_url: str | None):
     manager = AsyncCamoufox(**kwargs)
     browser = await manager.__aenter__()
     page = await browser.new_page()
+    if LOW_BANDWIDTH:
+        await _enable_low_bandwidth(page)
     page.set_default_timeout(max(60000, GOTO_TIMEOUT_MS + 15000))
     return manager, browser, page
 
