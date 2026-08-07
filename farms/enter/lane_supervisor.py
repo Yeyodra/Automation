@@ -174,8 +174,26 @@ def shared_heat_wait(path: Path, now: float | None = None) -> int:
 
 def trip_shared_heat(path: Path, cooldown: int, now: float | None = None) -> None:
     current = time.time() if now is None else now
-    existing = shared_heat_wait(path, current)
-    write_private_json(path, {"version": 1, "until": max(current + cooldown, current + existing)})
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        lock_path.chmod(0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        level = 0
+        last_denial = 0.0
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                level = int(data.get("level", 0))
+                last_denial = float(data.get("last_denial", 0))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        level = min(3, level + 1) if current - last_denial < 1800 else 1
+        duration = min(1800, cooldown * (2 ** (level - 1)))
+        write_private_json(path, {
+            "version": 1, "level": level, "last_denial": current,
+            "until": current + duration,
+        })
 
 
 def claim_domain_lease(path: Path, domain: str, lane: str, ttl: int,
