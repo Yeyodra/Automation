@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -113,6 +114,8 @@ class NinerouterPusher:
         self._pushed = 0
         self._failed = 0
         self._script_uploaded = False
+        self.command = _env("NINEROUTER_VPS_COMMAND")
+        self.key = _env("NINEROUTER_VPS_KEY")
 
     def queue(self, credential: dict) -> None:
         """Add credential to queue. Auto-pushes when queue reaches every_n."""
@@ -140,7 +143,9 @@ class NinerouterPusher:
         return {"pushed": self._pushed, "failed": self._failed, "queued": len(self._queue)}
 
     def _push(self, batch: list[dict]) -> bool:
-        """SSH push batch to remote 9router. Returns True on success."""
+        """SSH push batch to remote router. Returns True on success."""
+        if self.command:
+            return self._push_command(batch)
         paramiko = _get_paramiko()
         payload = json.dumps({"credentials": batch, "provider": self.provider})
         try:
@@ -178,6 +183,31 @@ class NinerouterPusher:
             self._failed += len(batch)
             _log(f"[9ROUTER] push error: {e}")
             # Re-queue on failure
+            with self._lock:
+                self._queue.extend(batch)
+            return False
+
+    def _push_command(self, batch: list[dict]) -> bool:
+        """Push JSON over key-only SSH to a native remote importer."""
+        payload = json.dumps({"credentials": batch, "provider": self.provider})
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+        if self.key:
+            command += ["-i", self.key]
+        command += [f"{self.user}@{self.host}", self.command]
+        try:
+            result = subprocess.run(command, input=payload, text=True, capture_output=True, timeout=150)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip()[:300] or f"exit {result.returncode}")
+            out = json.loads(result.stdout)
+            if not out.get("ok"):
+                raise RuntimeError(str(out.get("error") or out)[:300])
+            pushed = int(out.get("accounts", 0))
+            self._pushed += pushed
+            _log(f"[NVROUTER] pushed {pushed} account(s)")
+            return True
+        except Exception as e:
+            self._failed += len(batch)
+            _log(f"[NVROUTER] push error: {e}")
             with self._lock:
                 self._queue.extend(batch)
             return False
