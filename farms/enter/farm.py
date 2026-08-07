@@ -1855,9 +1855,9 @@ def _disposable_retry_action(mode: str, message: str) -> str:
     if mode not in ("emailqu", "rotate", "tempmail"):
         return "stop"
     low = message.lower()
-    if _is_domain_rejection(mode, message) or "otp timeout" in low:
+    if _is_domain_rejection(mode, message):
         return "block"
-    if "risk-aware gateway login not observed" in low:
+    if "otp timeout" in low or "risk-aware gateway login not observed" in low:
         return "retry"
     return "stop"
 

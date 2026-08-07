@@ -160,6 +160,12 @@ class PostAuthSetupTests(unittest.TestCase):
     def test_disposable_retry_covers_mailbox_and_risk_transients(self):
         self.assertEqual(
             self.farm._disposable_retry_action("rotate", "ROTATE OTP timeout after 180s"),
+            "retry",
+        )
+        self.assertEqual(
+            self.farm._disposable_retry_action(
+                "emailqu", "email domain is not allowed"
+            ),
             "block",
         )
         self.assertEqual(
