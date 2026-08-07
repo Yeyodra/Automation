@@ -112,6 +112,13 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
             "host=auth.converge.ai path=/u/login/password oauth_error=- banner=password_stalled",
         )
 
+    def test_callback_error_response_is_terminal_without_waiting_timeout(self):
+        source = inspect.getsource(self.farm.do_signup_and_oauth)
+        self.assertIn("callback_error", source)
+        self.assertIn("_is_enter_callback_url(url)", source)
+        self.assertIn("resp.status == 403", source)
+        self.assertIn("callback denied", source)
+
     def test_official_login_helper_waits_for_live_free_credits_cta(self):
         source = inspect.getsource(self.farm._click_official_login_action)
         self.assertIn("Get Free Credits", source)

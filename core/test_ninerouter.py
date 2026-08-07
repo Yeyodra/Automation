@@ -14,6 +14,29 @@ class NativeCommandPushTests(unittest.TestCase):
         self.pusher.key = "/key"
         self.batch = [{"email": "safe@example.invalid", "data": "{}"}]
 
+    def test_queue_returns_exact_auto_push_result(self):
+        self.pusher.every_n = 1
+        with patch.object(self.pusher, "_push", return_value=True) as push:
+            self.assertTrue(self.pusher.queue(self.batch[0]))
+        push.assert_called_once_with(self.batch)
+
+    def test_queue_returns_none_while_batch_is_pending(self):
+        self.pusher.every_n = 2
+        self.assertIsNone(self.pusher.queue(self.batch[0]))
+        self.assertEqual(self.pusher.stats["queued"], 1)
+
+    def test_native_command_rejects_coerced_boolean_counts(self):
+        for payload in (
+            {"ok": 1, "accounts": True, "skipped": False},
+            {"ok": True, "accounts": "1", "skipped": 0},
+            {"ok": True, "accounts": 1, "skipped": False},
+        ):
+            with self.subTest(payload=payload), patch("core.ninerouter.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = json.dumps(payload)
+                run.return_value.stderr = ""
+                self.assertFalse(self.pusher._push_command(self.batch))
+
     @patch("core.ninerouter.subprocess.run")
     def test_native_command_success_counts_imported_accounts(self, run):
         run.return_value.returncode = 0

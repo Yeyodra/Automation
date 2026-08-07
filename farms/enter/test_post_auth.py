@@ -6,6 +6,7 @@ import json
 import sys
 import types
 import unittest
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import patch
 
@@ -117,6 +118,59 @@ class PostAuthSetupTests(unittest.TestCase):
             ]):
                 with self.assertRaises(RuntimeError):
                     self.farm.enter_post_auth_setup("access", "gift")
+
+    def test_terminal_category_preserves_failure_boundaries(self):
+        cases = {
+            "RuntimeError: oauth_error=access_denied banner=access_denied": ("access_denied", "callback"),
+            "RuntimeError: EMAILQU OTP timeout after 180s": ("otp_timeout", "otp"),
+            "RuntimeError: domain_not_allowed: email domain is not allowed": ("identifier_domain_blocked", "identifier"),
+            "RuntimeError: risk-aware gateway login not observed": ("gateway_missing", "gateway"),
+            "RuntimeError: Turnstile solve failed before email submit": ("turnstile_failed", "turnstile"),
+            "RuntimeError: API POST /workspaces/1/api-keys returned 500": ("api_key_failed", "api_key"),
+            "RuntimeError: callback not reached: unknown": ("callback_failed", "callback"),
+            "RuntimeError: gateway session missing user": ("session_invalid", "session"),
+        }
+        for error, expected in cases.items():
+            with self.subTest(error=error):
+                self.assertEqual(self.farm._terminal_category(error), expected)
+
+    def test_final_push_updates_success_artifact_only_after_real_delivery(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "terminal.json"
+            with patch.object(self.farm, "TERMINAL_STATUS_FILE", path):
+                self.farm._write_terminal_status(
+                    attempt=1, ok=True, category="ok", domain="example.test",
+                    stage="complete", api_key_created=True, nvrouter_pushed=False,
+                )
+                self.farm._mark_terminal_push_complete(1)
+            self.assertTrue(json.loads(path.read_text())["nvrouter_pushed"])
+
+    def test_push_marker_ignores_failed_or_mismatched_artifacts(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "terminal.json"
+            with patch.object(self.farm, "TERMINAL_STATUS_FILE", path):
+                for payload in (
+                    {"version": 1, "attempt": 1, "ok": False, "category": "access_denied", "domain": "example.test", "stage": "callback", "api_key_created": False, "nvrouter_pushed": False, "at": "x"},
+                    {"version": 1, "attempt": 2, "ok": True, "category": "ok", "domain": "example.test", "stage": "complete", "api_key_created": True, "nvrouter_pushed": False, "at": "x"},
+                ):
+                    path.write_text(json.dumps(payload))
+                    self.farm._mark_terminal_push_complete(1)
+                    self.assertFalse(json.loads(path.read_text())["nvrouter_pushed"])
+
+    def test_terminal_artifact_is_atomic_and_secret_free(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "terminal.json"
+            with patch.object(self.farm, "TERMINAL_STATUS_FILE", path):
+                self.farm._write_terminal_status(
+                    attempt=1, ok=False, category="access_denied",
+                    domain="example.test", stage="callback",
+                    api_key_created=False, nvrouter_pushed=False,
+                )
+            payload = json.loads(path.read_text())
+            self.assertEqual(payload["category"], "access_denied")
+            self.assertEqual(payload["domain"], "example.test")
+            self.assertFalse(set(payload) & {"email", "password", "otp", "token", "api_key", "cookie", "code", "state"})
+            self.assertFalse(path.with_suffix(".tmp").exists())
 
     def test_registration_does_not_log_api_key_material(self):
         source = inspect.getsource(self.farm._do_register_body)

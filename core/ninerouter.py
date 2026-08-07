@@ -117,8 +117,8 @@ class NinerouterPusher:
         self.command = _env("NINEROUTER_VPS_COMMAND")
         self.key = _env("NINEROUTER_VPS_KEY")
 
-    def queue(self, credential: dict) -> None:
-        """Add credential to queue. Auto-pushes when queue reaches every_n."""
+    def queue(self, credential: dict) -> bool | None:
+        """Add credential; return exact auto-push result, or None while pending."""
         batch = None
         with self._lock:
             self._queue.append(credential)
@@ -126,8 +126,8 @@ class NinerouterPusher:
                 batch = list(self._queue)
                 self._queue.clear()
         if batch is None:
-            return
-        self._push(batch)
+            return None
+        return self._push(batch)
 
     def flush(self) -> None:
         """Push remaining queued credentials."""
@@ -199,10 +199,18 @@ class NinerouterPusher:
             if result.returncode:
                 raise RuntimeError(result.stderr.strip()[:300] or f"exit {result.returncode}")
             out = json.loads(result.stdout)
-            if not out.get("ok"):
-                raise RuntimeError(str(out.get("error") or out)[:300])
-            pushed = int(out.get("accounts", 0))
-            skipped = int(out.get("skipped", 0))
+            if (
+                not isinstance(out, dict)
+                or out.get("ok") is not True
+                or not isinstance(out.get("accounts"), int)
+                or isinstance(out.get("accounts"), bool)
+                or not isinstance(out.get("skipped", 0), int)
+                or isinstance(out.get("skipped", 0), bool)
+                or not isinstance(out.get("errors", []), list)
+            ):
+                raise RuntimeError("invalid native import response")
+            pushed = out["accounts"]
+            skipped = out.get("skipped", 0)
             if pushed != len(batch) or skipped or out.get("errors"):
                 raise RuntimeError(f"incomplete native import: {out}"[:300])
             self._pushed += pushed

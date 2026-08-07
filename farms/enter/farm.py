@@ -28,6 +28,7 @@ import re
 import secrets
 import string
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -638,6 +639,7 @@ BATCH_DIR: Path = RESULTS_ROOT
 RESULTS_JSON: Path = RESULTS_ROOT / "accounts.json"
 RESULTS_TXT: Path = RESULTS_ROOT / "accounts.txt"
 FAILED_JSON: Path = RESULTS_ROOT / "failed.json"
+TERMINAL_STATUS_FILE = Path(_env("ENTER_TERMINAL_STATUS_FILE")) if _env("ENTER_TERMINAL_STATUS_FILE") else None
 # Per-batch + global credential dumps (only successful accounts with api key)
 CREDS_TXT: Path = RESULTS_ROOT / "credentials.txt"
 CREDS_KEYS_TXT: Path = RESULTS_ROOT / "apikeys.txt"
@@ -4137,6 +4139,7 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
     """Browser: referral landing -> Enter gateway -> Auth0 signup -> gateway session."""
     login_seen = asyncio.Event()
     callback_seen = asyncio.Event()
+    callback_error: dict[str, str] = {}
 
     async def on_response(resp):
         url = resp.url or ""
@@ -4144,6 +4147,9 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
             login_seen.set()
         elif _is_enter_callback_url(url) and _is_gateway_callback_status(resp.status):
             await resp.finished()
+            callback_seen.set()
+        elif _is_enter_callback_url(url) and resp.status == 403:
+            callback_error["reason"] = _classify_auth_terminal(url, "")
             callback_seen.set()
 
     def on_nav(frame):
@@ -4410,6 +4416,9 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
         reason = _classify_auth_terminal(page.url, await _page_error_text(page))
         await screenshot(page, attempt, "auth_terminal")
         raise RuntimeError(f"Enter auth callback not reached: {reason}") from e
+
+    if callback_error:
+        raise RuntimeError(f"Enter auth callback denied: {callback_error['reason']}")
 
     try:
         await wait_url(page, _is_enter_app_url, 8)
@@ -5065,8 +5074,8 @@ def inject_to_9router(api_key: str, workspace_id: str, email: str = "", name: st
         return False, f"{type(e).__name__}: {e}"
 
 
-async def save_result_to_file(result: dict) -> None:
-    """Save successful account JSON + dedicated credential/apikey txt files."""
+async def save_result_to_file(result: dict) -> bool:
+    """Save successful account and return exact native auto-push result."""
     async with _results_lock:
         rows = []
         if RESULTS_JSON.is_file():
@@ -5192,10 +5201,82 @@ async def save_result_to_file(result: dict) -> None:
                 data_obj["expiresAt"] = tokens["expires_at"]
             from core.ninerouter import make_credential
             cred = make_credential(NINEROUTER_PROVIDER, email, data_obj)
-            _vps_pusher.queue(cred)
+            pushed = _vps_pusher.queue(cred)
+            return bool(pushed)
+        return False
+
+
+def _terminal_category(error: str) -> tuple[str, str]:
+    low = error.lower()
+    rules = (
+        ("identifier_domain_blocked", "identifier", ("domain_not_allowed", "domain is not allowed", "not allowed to sign up", "email provider is not allowed")),
+        ("access_denied", "callback", ("access_denied",)),
+        ("otp_timeout", "otp", ("otp timeout",)),
+        ("gateway_missing", "gateway", ("risk-aware gateway login not observed",)),
+        ("turnstile_failed", "turnstile", ("turnstile", "captcha")),
+        ("password_stalled", "password", ("password_stalled", "password stall")),
+        ("account_timeout", "account", ("account timeout",)),
+        ("api_key_failed", "api_key", ("api key", "api-key", "apikey", "api-keys")),
+        ("workspace_missing", "workspace", ("workspace",)),
+        ("session_invalid", "session", ("gateway session", "session invalid", "unauthenticated")),
+        ("callback_failed", "callback", ("callback",)),
+    )
+    for category, stage, needles in rules:
+        if any(needle in low for needle in needles):
+            return category, stage
+    return "other", "unknown"
+
+
+def _write_terminal_status(*, attempt: int, ok: bool, category: str, domain: str,
+                           stage: str, api_key_created: bool, nvrouter_pushed: bool) -> None:
+    if TERMINAL_STATUS_FILE is None:
+        return
+    payload = {
+        "version": 1, "attempt": attempt, "ok": ok, "category": category,
+        "domain": domain, "stage": stage, "api_key_created": api_key_created,
+        "nvrouter_pushed": nvrouter_pushed,
+        "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    TERMINAL_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    TERMINAL_STATUS_FILE.parent.chmod(0o700)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{TERMINAL_STATUS_FILE.name}.", dir=TERMINAL_STATUS_FILE.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+        temporary.chmod(0o600)
+        temporary.replace(TERMINAL_STATUS_FILE)
+        TERMINAL_STATUS_FILE.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _mark_terminal_push_complete(attempt: int) -> None:
+    if TERMINAL_STATUS_FILE is None or not TERMINAL_STATUS_FILE.is_file():
+        return
+    try:
+        payload = json.loads(TERMINAL_STATUS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if payload.get("version") != 1 or payload.get("attempt") != attempt or payload.get("category") not in {"ok", "nvrouter_push_failed"}:
+        return
+    _write_terminal_status(
+        attempt=attempt, ok=True, category="ok", domain=str(payload.get("domain") or ""),
+        stage="complete", api_key_created=bool(payload.get("api_key_created")),
+        nvrouter_pushed=True,
+    )
 
 
 async def save_failed_to_file(attempt: int, email: str, err: str) -> None:
+    category, stage = _terminal_category(err)
+    domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
+    _write_terminal_status(
+        attempt=attempt, ok=False, category=category, domain=domain, stage=stage,
+        api_key_created=False, nvrouter_pushed=False,
+    )
     async with _results_lock:
         rows = []
         if FAILED_JSON.is_file():
@@ -5302,7 +5383,14 @@ async def register_one_account(
                     _do_register_body(attempt, email_addr, password, proxy_url, proxy_id),
                     timeout=ACCOUNT_TIMEOUT_S,
                 )
-                await save_result_to_file(result)
+                pushed = await save_result_to_file(result)
+                domain = email_addr.rsplit("@", 1)[-1].lower() if "@" in email_addr else ""
+                _write_terminal_status(
+                    attempt=attempt, ok=pushed,
+                    category="ok" if pushed else "nvrouter_push_failed", domain=domain,
+                    stage="complete" if pushed else "nvrouter_push",
+                    api_key_created=True, nvrouter_pushed=pushed,
+                )
                 _domain_fail_reset(email_addr)
                 emit_success(attempt, email_addr, "ok")
                 await _maybe_warp_after_success(attempt)
@@ -5545,6 +5633,8 @@ async def main() -> None:
     if _vps_pusher is not None:
         _vps_pusher.flush()
         s = _vps_pusher.stats
+        if s["pushed"] > 0 and s["queued"] == 0:
+            _mark_terminal_push_complete(1)
         slog("9ROUTER", f"VPS push final: pushed={s['pushed']} failed={s['failed']}")
     slog("DONE", f"ok={ok}/{n} batch={BATCH_DIR}")
     if not HUD.enabled:
