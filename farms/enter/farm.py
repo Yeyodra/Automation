@@ -4098,11 +4098,25 @@ async def _click_official_login_action(page, timeout: float = 12.0) -> bool:
             except Exception:
                 pass
         try:
+            invite = page.get_by_role("dialog").filter(
+                has_text=re.compile(r"You've got an invite", re.I)
+            )
+            for index in range(await invite.count()):
+                dialog = invite.nth(index)
+                if not await dialog.is_visible():
+                    continue
+                close = dialog.get_by_role("button", name="Close", exact=True)
+                if await close.count() and await close.first.is_visible():
+                    await close.first.click(timeout=3000, no_wait_after=True)
+                    await dialog.wait_for(state="hidden", timeout=3000)
+        except Exception:
+            pass
+        try:
             locator = page.get_by_role("button", name=re.compile(r"^Get Free Credits$", re.I))
             for index in range(await locator.count()):
                 button = locator.nth(index)
                 if await button.is_visible():
-                    await button.click(timeout=3000)
+                    await button.evaluate("element => element.click()")
                     return True
         except Exception:
             pass
@@ -4111,7 +4125,7 @@ async def _click_official_login_action(page, timeout: float = 12.0) -> bool:
             for index in range(await locator.count()):
                 target = locator.nth(index)
                 if await target.is_visible():
-                    await target.click(timeout=3000)
+                    await target.evaluate("element => element.click()")
                     return True
         except Exception:
             pass
