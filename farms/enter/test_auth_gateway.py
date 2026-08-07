@@ -82,6 +82,14 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
         self.assertFalse(self.farm._is_gateway_callback_status(200))
         self.assertFalse(self.farm._is_gateway_callback_status(500))
 
+    def test_terminal_auth_reason_redacts_query_values(self):
+        reason = self.farm._classify_auth_terminal(
+            "https://enter.converge.ai/?error=access_denied&state=secret&code=secret",
+            "Something went wrong",
+        )
+        self.assertEqual(reason, "host=enter.converge.ai path=/ oauth_error=access_denied banner=access_denied")
+        self.assertNotIn("secret", reason)
+
     def test_official_login_helper_waits_for_live_free_credits_cta(self):
         source = inspect.getsource(self.farm._click_official_login_action)
         self.assertIn("Get Free Credits", source)

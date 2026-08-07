@@ -3915,6 +3915,21 @@ def _is_gateway_callback_status(status: int) -> bool:
     return 300 <= status < 400
 
 
+def _classify_auth_terminal(url: str, text: str) -> str:
+    parsed = urlparse(url or "")
+    error = (parse_qs(parsed.query).get("error") or [""])[0]
+    lower = (text or "").lower()
+    if error == "access_denied" or "access denied" in lower or "risk_control_blocked" in lower:
+        banner = "access_denied"
+    elif "too many" in lower or "rate limit" in lower:
+        banner = "rate"
+    elif "domain" in lower and ("not allowed" in lower or "blocked" in lower):
+        banner = "domain"
+    else:
+        banner = "unknown"
+    return f"host={parsed.hostname or '-'} path={parsed.path or '/'} oauth_error={error or '-'} banner={banner}"
+
+
 def _is_enter_app_url(url: str) -> bool:
     return _is_enter_url(url, "/")
 
@@ -4247,7 +4262,8 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
         await asyncio.wait_for(callback_seen.wait(), timeout=60)
     except asyncio.TimeoutError as e:
         await raise_if_rate_limited(page, attempt, "wait_callback")
-        raise RuntimeError("Enter auth callback not reached") from e
+        reason = _classify_auth_terminal(page.url, await _page_error_text(page))
+        raise RuntimeError(f"Enter auth callback not reached: {reason}") from e
 
     try:
         await wait_url(page, _is_enter_app_url, 8)
