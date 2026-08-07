@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from farms.enter.lane_supervisor import (
     FARM_RESULTS_SENTINEL,
+    claim_domain_lease,
     classify_outcome,
     global_start_wait,
     load_scheduler_state,
@@ -155,6 +156,14 @@ class LaneSupervisorTests(unittest.TestCase):
             parse_blocked_domains("bad.test # explicit rejection\nother.test reason text\n"),
             {"bad.test", "other.test"},
         )
+
+    def test_cross_lane_domain_lease_prevents_identity_collision(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "leases.json"
+            self.assertTrue(claim_domain_lease(path, "same.test", "lane-a", 300, now=1000))
+            self.assertFalse(claim_domain_lease(path, "same.test", "lane-b", 300, now=1100))
+            self.assertTrue(claim_domain_lease(path, "other.test", "lane-b", 300, now=1100))
+            self.assertTrue(claim_domain_lease(path, "same.test", "lane-b", 300, now=1301))
 
     def test_global_start_gate_calculates_cross_lane_wait_atomically(self):
         with TemporaryDirectory() as directory:

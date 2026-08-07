@@ -160,6 +160,43 @@ def select_contextual_domain(queue: list[str], cooldowns: dict[str, float],
     return selected
 
 
+def claim_domain_lease(path: Path, domain: str, lane: str, ttl: int,
+                       now: float | None = None) -> bool:
+    if ttl <= 0:
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    current = time.time() if now is None else now
+    with path.open("a+", encoding="utf-8") as handle:
+        path.chmod(0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        try:
+            leases = json.load(handle)
+        except (json.JSONDecodeError, ValueError):
+            leases = {}
+        if not isinstance(leases, dict):
+            leases = {}
+        leases = {
+            key: value for key, value in leases.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("until"), (int, float))
+            and math.isfinite(float(value["until"]))
+            and float(value["until"]) > current
+        }
+        existing = leases.get(domain)
+        if existing and existing.get("lane") != lane:
+            return False
+        leases[domain] = {"lane": lane, "until": current + ttl}
+        handle.seek(0)
+        handle.truncate()
+        json.dump(leases, handle, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        return True
+
+
 def global_start_wait(path: Path, gap: int, now: float | None = None) -> int:
     if gap <= 0:
         return 0
@@ -285,6 +322,7 @@ def main() -> None:
     parser.add_argument("--min-reuse", type=int, default=120)
     parser.add_argument("--explore-every", type=int, default=5)
     parser.add_argument("--global-start-gap", type=int, default=0)
+    parser.add_argument("--cross-lane-domain-lease", type=int, default=300)
     args = parser.parse_args()
 
     blocked_file = resolve_blocked_file(os.environ)
@@ -320,6 +358,13 @@ def main() -> None:
             wakeups = [value for value in cooldowns.values() if value > now]
             wakeups += [value + max(0, args.min_reuse) for value in last_used.values() if value + max(0, args.min_reuse) > now]
             time.sleep(max(30, int(min(wakeups, default=now + 60) - now)))
+            continue
+        lease_file = runtime_dir / "cross-lane-domain-leases.json"
+        if not claim_domain_lease(
+            lease_file, domain, lane, max(0, args.cross_lane_domain_lease)
+        ):
+            attempt_number -= 1
+            cooldowns[domain] = time.time() + 30
             continue
         last_used[domain] = now
         start_gate = runtime_dir / "global-start.lock"
