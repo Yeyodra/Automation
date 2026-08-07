@@ -45,6 +45,18 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
         self.assertFalse(self.farm._is_enter_login_url("http://enter.converge.ai/auth/login"))
         self.assertFalse(self.farm._is_enter_login_url("https://enter.converge.ai:444/auth/login"))
 
+    def test_gateway_login_requires_risk_session(self):
+        self.assertTrue(
+            self.farm._is_risk_aware_login_url(
+                "https://enter.converge.ai/auth/login?return_to=%2F&risk_session_id=rs_123"
+            )
+        )
+        self.assertFalse(
+            self.farm._is_risk_aware_login_url(
+                "https://enter.converge.ai/auth/login?return_to=%2F"
+            )
+        )
+
     def test_browser_signup_uses_gateway_callback_and_session_boundary(self):
         source = inspect.getsource(self.farm.do_signup_and_oauth)
         session_source = inspect.getsource(self.farm._fetch_gateway_session)
@@ -55,6 +67,8 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
         self.assertNotIn("_signin_snarf_tokens", source)
         self.assertNotIn("timeout=10", source)
         self.assertIn("_click_official_login_action", source)
+        self.assertIn("_is_risk_aware_login_url", source)
+        self.assertNotIn('label="gateway_login"', source)
         self.assertIn("_is_enter_callback_url", source)
         self.assertIn("await resp.finished()", source)
         self.assertIn("_is_gateway_callback_status", source)
@@ -90,12 +104,32 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
         self.assertEqual(reason, "host=enter.converge.ai path=/ oauth_error=access_denied banner=access_denied")
         self.assertNotIn("secret", reason)
 
+    def test_terminal_auth_reason_classifies_password_stall(self):
+        self.assertEqual(
+            self.farm._classify_auth_terminal(
+                "https://auth.converge.ai/u/login/password?state=secret", ""
+            ),
+            "host=auth.converge.ai path=/u/login/password oauth_error=- banner=password_stalled",
+        )
+
     def test_official_login_helper_waits_for_live_free_credits_cta(self):
         source = inspect.getsource(self.farm._click_official_login_action)
         self.assertIn("Get Free Credits", source)
+        self.assertIn("get_by_text", source)
         self.assertIn("Reject All", source)
         self.assertIn("locator.count()", source)
         self.assertIn("is_visible()", source)
+
+    def test_required_turnstile_failure_stops_before_email_submit(self):
+        source = inspect.getsource(self.farm.do_signup_and_oauth)
+        self.assertIn("Turnstile solve failed before email submit", source)
+        self.assertIn('screenshot(page, attempt, "turnstile_timeout")', inspect.getsource(self.farm._handle_turnstile_inner))
+
+    def test_manual_turnstile_waits_for_real_token_without_clicking(self):
+        source = inspect.getsource(self.farm._handle_turnstile_inner)
+        manual = source[source.index("if MANUAL_TURNSTILE:"):source.index("clicks = 0")]
+        self.assertIn("turnstile_token_len", manual)
+        self.assertNotIn("try_click_turnstile", manual)
 
 
 class GatewaySessionTests(unittest.IsolatedAsyncioTestCase):
@@ -109,7 +143,7 @@ class GatewaySessionTests(unittest.IsolatedAsyncioTestCase):
                 self.script = script
                 return {
                     "status": 200,
-                    "body": '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token-value","expiresAt":"2026-08-08T00:00:00Z"}',
+                    "body": '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token-value","expiresAt":1786147200000}',
                 }
 
         page = Page()
@@ -122,14 +156,14 @@ class GatewaySessionTests(unittest.IsolatedAsyncioTestCase):
     def test_authenticated_session_is_normalized(self):
         session = self.farm._parse_gateway_session(
             200,
-            '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token-value","expiresAt":"2026-08-08T00:00:00Z"}',
+            '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token-value","expiresAt":1786147200000}',
         )
 
         self.assertEqual(
             session,
             {
                 "access_token": "token-value",
-                "expires_at": "2026-08-08T00:00:00Z",
+                "expires_at": 1786147200000,
                 "user": {"sub": "user-1", "isNewUser": True},
             },
         )
@@ -142,7 +176,9 @@ class GatewaySessionTests(unittest.IsolatedAsyncioTestCase):
             (200, '{"user":{},"accessToken":"token","expiresAt":"soon"}'),
             (200, '{"user":{"sub":"user-1","isNewUser":false},"accessToken":"token","expiresAt":"soon"}'),
             (200, '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token","expiresAt":0}'),
+            (200, '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token","expiresAt":1786147200}'),
             (200, '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token","expiresAt":{}}'),
+            (200, '{"user":{"sub":"user-1","isNewUser":true},"accessToken":"token","expiresAt":"2026-08-08T00:00:00Z"}'),
             (200, '{"user":{"sub":"user-1"},"accessToken":"","expiresAt":"soon"}'),
             (200, '{"user":{"sub":"user-1"},"accessToken":"token","expiresAt":"   "}'),
         ]

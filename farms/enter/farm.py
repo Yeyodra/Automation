@@ -510,7 +510,7 @@ TEMPMAIL_ROTATION = tuple(
     x.strip().lower()
     for x in _env(
         "ENTER_TEMPMAIL_ROTATION",
-        "generator,emailqu,exzork,mail.tm,tempmail.io,guerrillamail",
+        "mail.tm,tempmail.io,guerrillamail,emailqu",
     ).split(",")
     if x.strip()
 )
@@ -525,6 +525,11 @@ EXZORK_API_KEY = _env("ENTER_EXZORK_API_KEY", _env("EXZORK_API_KEY"))
 EXZORK_DOMAIN = _env("ENTER_EXZORK_DOMAIN", _env("EXZORK_DOMAIN")).lstrip("@").lstrip("*.").lower()
 EXZORK_WILDCARD = _env_bool("ENTER_EXZORK_WILDCARD", True)
 EMAILQU_API = _env("ENTER_EMAILQU_API", "https://emailqu.com").rstrip("/")
+EMAILQU_DOMAIN = _env("ENTER_EMAILQU_DOMAIN").lstrip("@").lower()
+CAMOUFOX_OS = _env("ENTER_BROWSER_OS", "linux").lower()
+BROWSER_ENGINE = _env("ENTER_BROWSER_ENGINE", "camoufox").lower()
+BROWSER_EXECUTABLE = _env("ENTER_BROWSER_EXECUTABLE")
+MANUAL_TURNSTILE = _env_bool("ENTER_MANUAL_TURNSTILE", False)
 ACCOUNT_PASSWORD = _env("ENTER_PASSWORD", "@EnterPass1")
 MAX_ACCOUNTS = int(_env("ENTER_MAX_ACCOUNTS", "1") or "1")
 CONCURRENT = int(_env("ENTER_CONCURRENT", "1") or "1")
@@ -1827,6 +1832,35 @@ def _domain_fail_reset(email_addr: str) -> None:
         _domain_fail_count.pop(dom, None)
 
 
+def _domain_retry_count(mode: str, configured: int) -> int:
+    return min(4, max(1, configured)) if mode in ("emailqu", "rotate", "tempmail") else 1
+
+
+def _is_domain_rejection(mode: str, message: str) -> bool:
+    if mode not in ("gptmail", "generator", "exzork", "emailqu", "rotate", "tempmail"):
+        return False
+    low = message.lower()
+    return (
+        "domain_not_allowed" in low
+        or "domain is not allowed" in low
+        or "email domain is not allowed" in low
+        or "not allowed to sign up" in low
+        or "email provider is not allowed" in low
+        or ("domain" in low and "not allowed" in low)
+    )
+
+
+def _disposable_retry_action(mode: str, message: str) -> str:
+    if mode not in ("emailqu", "rotate", "tempmail"):
+        return "stop"
+    low = message.lower()
+    if _is_domain_rejection(mode, message) or "otp timeout" in low:
+        return "block"
+    if "risk-aware gateway login not observed" in low:
+        return "retry"
+    return "stop"
+
+
 def _gptmail_make_local() -> str:
     """Custom prefix is client-side only (no dedicated API) — random local-part."""
     if GPTMAIL_PREFIX:
@@ -2247,6 +2281,22 @@ def _emailqu_get(path: str, etag: str = "") -> tuple[int, dict, str]:
         if e.code == 304:
             return 304, {}, e.headers.get("ETag", etag)
         raise
+    except urllib.error.URLError:
+        if not _proxy_pool:
+            raise
+        import requests
+
+        proxy = _proxy_pool[0][0].replace("socks5://", "socks5h://")
+        response = requests.get(
+            f"{EMAILQU_API}{path}",
+            headers=headers,
+            proxies={"http": proxy, "https": proxy},
+            timeout=20,
+        )
+        if response.status_code == 304:
+            return 304, {}, response.headers.get("ETag", etag)
+        response.raise_for_status()
+        return response.status_code, response.json(), response.headers.get("ETag", "")
 
 
 def _emailqu_apex_domains() -> list[str]:
@@ -2273,7 +2323,10 @@ def create_emailqu_inbox() -> str:
     username = re.sub(r"[^a-z0-9]", "", str(data.get("username") or "").lower())
     if not username:
         raise RuntimeError("emailqu: random username missing")
-    domain = random.choice(_emailqu_apex_domains())
+    domains = _emailqu_apex_domains()
+    if EMAILQU_DOMAIN and EMAILQU_DOMAIN not in domains:
+        raise RuntimeError("emailqu: pinned domain is not a public apex domain")
+    domain = EMAILQU_DOMAIN or random.choice(domains)
     _, verified, _ = _emailqu_get(f"/api/domain/verify/{quote(domain, safe='')}")
     if not verified.get("verified"):
         raise RuntimeError(f"emailqu: domain not verified: {domain}")
@@ -2371,14 +2424,23 @@ def _poll_tempmail_io(address: str, token: str, timeout: int, since_ts: float | 
 
 def _create_guerrillamail() -> tuple[str, str]:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(f"{GUERRILLA_API}?f=get_email_address&ip=127.0.0.1&agent=enter-farm", timeout=20) as response:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    }
+    first_request = urllib.request.Request(
+        f"{GUERRILLA_API}?f=get_email_address&ip=127.0.0.1&agent=enter-farm",
+        headers=headers,
+    )
+    with opener.open(first_request, timeout=20) as response:
         first = json.load(response)
     sid = str(first["sid_token"])
     local = _crypto_local_part(12)
-    with opener.open(
+    set_request = urllib.request.Request(
         f"{GUERRILLA_API}?f=set_email_user&email_user={quote(local)}&sid_token={quote(sid)}",
-        timeout=20,
-    ) as response:
+        headers=headers,
+    )
+    with opener.open(set_request, timeout=20) as response:
         data = json.load(response)
     return str(data.get("email_addr") or first["email_addr"]).lower(), sid
 
@@ -2405,8 +2467,8 @@ def _poll_guerrillamail(address: str, token: str, timeout: int, since_ts: float 
 
 
 def _rotation_candidates() -> list[str]:
-    supported = {"generator", "emailqu", "exzork", "mail.tm", "tempmail.io", "guerrillamail"}
-    return [p for p in TEMPMAIL_ROTATION if p in supported and (p != "exzork" or (EXZORK_API_KEY and EXZORK_DOMAIN))]
+    supported = {"mail.tm", "tempmail.io", "guerrillamail", "emailqu"}
+    return [p for p in TEMPMAIL_ROTATION if p in supported]
 
 
 def create_rotating_inbox() -> str:
@@ -2420,30 +2482,32 @@ def create_rotating_inbox() -> str:
     errors: list[str] = []
     for offset in range(len(providers)):
         provider = providers[(start + offset) % len(providers)]
-        try:
-            if provider == "generator":
-                from generator_email import create_inbox
-                address, token = create_inbox(), ""
-            elif provider == "emailqu":
-                address, token = create_emailqu_inbox(), ""
-            elif provider == "exzork":
-                address, token = create_exzork_inbox(), ""
-            elif provider == "mail.tm":
-                address, token = create_tempmail_account(), ""
-            elif provider == "tempmail.io":
-                address, token = _create_tempmail_io()
-            else:
-                address, token = _create_guerrillamail()
-            domain = address.rsplit("@", 1)[-1].lower()
-            if domain in _gptmail_blocked_domains:
-                raise RuntimeError(f"blocked domain {domain}")
-            with _rotating_mail_lock:
-                _rotating_mail_accounts[address.lower()] = (provider, token)
-            print(f"[ROTATE] provider={provider} domain={domain}", flush=True)
-            return address
-        except Exception as e:
-            errors.append(f"{provider}:{type(e).__name__}")
-            print(f"[ROTATE] {provider} unavailable: {type(e).__name__}: {e}", flush=True)
+        for _ in range(4):
+            try:
+                if provider == "generator":
+                    from generator_email import create_inbox
+                    address, token = create_inbox(), ""
+                elif provider == "emailqu":
+                    address, token = create_emailqu_inbox(), ""
+                elif provider == "exzork":
+                    address, token = create_exzork_inbox(), ""
+                elif provider == "mail.tm":
+                    address, token = create_tempmail_account(), ""
+                elif provider == "tempmail.io":
+                    address, token = _create_tempmail_io()
+                else:
+                    address, token = _create_guerrillamail()
+                domain = address.rsplit("@", 1)[-1].lower()
+                if domain in _gptmail_blocked_domains:
+                    continue
+                with _rotating_mail_lock:
+                    _rotating_mail_accounts[address.lower()] = (provider, token)
+                print(f"[ROTATE] provider={provider} domain={domain}", flush=True)
+                return address
+            except Exception as e:
+                errors.append(f"{provider}:{type(e).__name__}")
+                print(f"[ROTATE] {provider} unavailable: {type(e).__name__}: {e}", flush=True)
+                break
     raise RuntimeError("rotate: all providers failed (" + ", ".join(errors) + ")")
 
 
@@ -3160,19 +3224,27 @@ def enter_post_auth_setup(access_token: str, gift_code: str) -> dict:
     """Validate the captured post-auth v2 contract and create one API key."""
     out: dict[str, Any] = {}
 
-    claim = _api_json(
-        "POST", "/code/api/v1/referral/claim", access_token,
-        body=None, query={"code": gift_code}, send_json=True,
-    )
-    _require_api_data(claim, "referral claim")
-    out["referral_claim"] = claim
+    try:
+        claim = _api_json(
+            "POST", "/code/api/v1/referral/claim", access_token,
+            body=None, query={"code": gift_code}, send_json=True,
+        )
+        _require_api_data(claim, "referral claim")
+        out["referral_claim"] = claim
+    except Exception as e:
+        # ponytail: official client treats claim failure as nonfatal and always
+        # continues to /workspace; preserve the error for accounting.
+        out["referral_claim_error"] = str(e)
 
     user_info = _api_json("GET", "/code/api/v1/users/info", access_token)
     user_data = _require_api_data(user_info, "users info")
     if not isinstance(user_data, dict) or user_data.get("must_verify_email") is not False:
         raise RuntimeError("user email is not verified")
-    if user_data.get("merge_action"):
-        raise RuntimeError("user merge action is unresolved")
+    merge_action = user_data.get("merge_action") or "no_action"
+    merge_candidate = user_data.get("merge_candidate_id")
+    merge_block = user_data.get("merge_block_reason")
+    if merge_action == "candidate_pending" and merge_candidate and not merge_block:
+        raise RuntimeError("user merge candidate requires resolution")
     out["user_info"] = user_info
 
     workspaces = _api_json("GET", "/code/api/v1/workspaces", access_token)
@@ -3318,10 +3390,25 @@ async def goto_with_retry(
 
 
 async def launch_browser(proxy_url: str | None):
+    if BROWSER_ENGINE == "chrome":
+        from playwright.async_api import async_playwright
+
+        manager = async_playwright()
+        playwright = await manager.__aenter__()
+        launch: dict[str, Any] = {"headless": HEADLESS}
+        if BROWSER_EXECUTABLE:
+            launch["executable_path"] = BROWSER_EXECUTABLE
+        if proxy_url:
+            launch["proxy"] = _parse_proxy(proxy_url)
+        browser = await playwright.chromium.launch(**launch)
+        page = await browser.new_page(locale="en-US")
+        page.set_default_timeout(max(60000, GOTO_TIMEOUT_MS + 15000))
+        return manager, browser, page
+
     kwargs: dict[str, Any] = {
         "headless": HEADLESS,
         "humanize": 0.5,
-        "os": random.choice(["windows", "macos", "linux"]),
+        "os": CAMOUFOX_OS if CAMOUFOX_OS in {"windows", "macos", "linux"} else "linux",
         "locale": "en-US",
         "geoip": True,
         "block_webrtc": True,
@@ -3751,6 +3838,16 @@ async def _handle_turnstile_inner(
     allow_remount: bool = True,
 ) -> bool:
     deadline = time.monotonic() + max_wait
+    if MANUAL_TURNSTILE:
+        alog(attempt, f"Turnstile: waiting for manual completion ({max_wait:.0f}s)")
+        while time.monotonic() < deadline:
+            if await turnstile_token_len(page) > 20:
+                alog(attempt, "Turnstile: manual completion detected")
+                return True
+            await asyncio.sleep(1.0)
+        await screenshot(page, attempt, "turnstile_timeout")
+        alog(attempt, f"Turnstile: manual timeout after {max_wait}s")
+        return False
     clicks = 0
     remounts = 0
     while time.monotonic() < deadline:
@@ -3878,6 +3975,7 @@ async def _handle_turnstile_inner(
     tok = await turnstile_token_len(page)
     if tok > 20:
         return True
+    await screenshot(page, attempt, "turnstile_timeout")
     alog(attempt, f"Turnstile: timeout after {max_wait}s (token_len={tok})")
     return False
 
@@ -3907,6 +4005,13 @@ def _is_enter_login_url(url: str) -> bool:
     return _is_enter_url(url, "/auth/login")
 
 
+def _is_risk_aware_login_url(url: str) -> bool:
+    if not _is_enter_login_url(url):
+        return False
+    risk = (parse_qs(urlparse(url).query).get("risk_session_id") or [""])[0]
+    return bool(risk.strip())
+
+
 def _is_enter_callback_url(url: str) -> bool:
     return _is_enter_url(url, "/auth/callback")
 
@@ -3919,7 +4024,9 @@ def _classify_auth_terminal(url: str, text: str) -> str:
     parsed = urlparse(url or "")
     error = (parse_qs(parsed.query).get("error") or [""])[0]
     lower = (text or "").lower()
-    if error == "access_denied" or "access denied" in lower or "risk_control_blocked" in lower:
+    if parsed.hostname == urlparse(AUTH_HOST).hostname and "password" in parsed.path:
+        banner = "password_stalled"
+    elif error == "access_denied" or "access denied" in lower or "risk_control_blocked" in lower:
         banner = "access_denied"
     elif "too many" in lower or "rate limit" in lower:
         banner = "rate"
@@ -3952,7 +4059,11 @@ def _parse_gateway_session(status: int, body: str) -> dict:
         raise RuntimeError("gateway session is not a new user")
     if not isinstance(access, str) or not access.strip():
         raise RuntimeError("gateway session missing accessToken")
-    if not isinstance(expires_at, str) or not expires_at.strip():
+    if (
+        not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+        or not 1_000_000_000_000 <= expires_at <= 9_999_999_999_999
+    ):
         raise RuntimeError("gateway session missing expiresAt")
     return {"access_token": access, "expires_at": expires_at, "user": user}
 
@@ -3991,6 +4102,15 @@ async def _click_official_login_action(page, timeout: float = 12.0) -> bool:
                     return True
         except Exception:
             pass
+        try:
+            locator = page.get_by_text(re.compile(r"^Get Free Credits$", re.I), exact=True)
+            for index in range(await locator.count()):
+                target = locator.nth(index)
+                if await target.is_visible():
+                    await target.click(timeout=3000)
+                    return True
+        except Exception:
+            pass
         await asyncio.sleep(0.5)
     return False
 
@@ -4002,7 +4122,7 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
 
     async def on_response(resp):
         url = resp.url or ""
-        if _is_enter_login_url(url):
+        if _is_risk_aware_login_url(url):
             login_seen.set()
         elif _is_enter_callback_url(url) and _is_gateway_callback_status(resp.status):
             await resp.finished()
@@ -4011,7 +4131,7 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
     def on_nav(frame):
         if frame != page.main_frame:
             return
-        if _is_enter_login_url(frame.url):
+        if _is_risk_aware_login_url(frame.url):
             login_seen.set()
 
     page.on("response", on_response)
@@ -4027,18 +4147,18 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
 
     # The landing action owns FPJS risk preflight and gateway PKCE. If the app
     # fails open without navigating, use only its same-origin gateway fallback.
-    started = await _click_official_login_action(page)
-    if started:
-        alog(attempt, "official login action triggered")
-    try:
-        await asyncio.wait_for(login_seen.wait(), timeout=13)
-    except asyncio.TimeoutError:
-        await goto_with_retry(
-            page,
-            f"{APP_HOST}/auth/login?return_to=%2F",
-            attempt,
-            label="gateway_login",
-        )
+    for login_try in range(2):
+        started = await _click_official_login_action(page)
+        if started:
+            alog(attempt, "official login action triggered")
+        try:
+            await asyncio.wait_for(login_seen.wait(), timeout=13)
+            break
+        except asyncio.TimeoutError:
+            if login_try:
+                raise RuntimeError("risk-aware gateway login not observed")
+            await goto_with_retry(page, land, attempt, label="landing_retry")
+            await asyncio.sleep(3.0)
     await asyncio.sleep(1.5)
 
     # Prefer signup over login
@@ -4108,7 +4228,14 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
         raise RuntimeError("could not fill email")
     alog(attempt, f"email filled")
 
-    await handle_turnstile(page, attempt, max_wait=60, require_token=True, use_global_limit=True)
+    if not await handle_turnstile(
+        page,
+        attempt,
+        max_wait=180 if MANUAL_TURNSTILE else 60,
+        require_token=True,
+        use_global_limit=True,
+    ):
+        raise RuntimeError("Turnstile solve failed before email submit")
     await asyncio.sleep(0.5)
 
     otp_since = time.time()
@@ -4263,6 +4390,7 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
     except asyncio.TimeoutError as e:
         await raise_if_rate_limited(page, attempt, "wait_callback")
         reason = _classify_auth_terminal(page.url, await _page_error_text(page))
+        await screenshot(page, attempt, "auth_terminal")
         raise RuntimeError(f"Enter auth callback not reached: {reason}") from e
 
     try:
@@ -5141,7 +5269,7 @@ async def register_one_account(
         await _wait_rate_limit_window(attempt)
         password = ACCOUNT_PASSWORD
         proxy_url, proxy_id = await next_proxy()
-        domain_tries = GPTMAIL_DOMAIN_RETRIES if EMAIL_MODE in ("gptmail", "generator", "exzork", "emailqu", "rotate") else 1
+        domain_tries = _domain_retry_count(EMAIL_MODE, GPTMAIL_DOMAIN_RETRIES)
         last_msg = ""
         for dom_try in range(1, domain_tries + 1):
             email_addr = await generate_email(worker_slot=worker_slot)
@@ -5177,27 +5305,21 @@ async def register_one_account(
                     or "nav timeout" in low
                     or "still on blank" in low
                 )
-                # Track per-domain fails (auto-blacklist after threshold)
-                if not nav_fail:
+                retry_action = _disposable_retry_action(EMAIL_MODE, msg)
+                # Only explicit provider/domain rejection is evidence against a domain.
+                if not nav_fail and _is_domain_rejection(EMAIL_MODE, msg):
                     _domain_fail_track(email_addr, msg[:120], worker_slot=worker_slot)
-                is_domain_block = EMAIL_MODE in ("gptmail", "generator", "exzork", "emailqu", "rotate") and (
-                    "domain_not_allowed" in low
-                    or "domain is not allowed" in low
-                    or "email domain is not allowed" in low
-                    or "not allowed to sign up" in low
-                    or "email provider is not allowed" in low
-                    or ("domain" in low and "not allowed" in low)
-                )
-                if is_domain_block:
+                if retry_action != "stop":
                     dom = email_addr.split("@")[-1] if "@" in email_addr else ""
-                    gptmail_block_domain(dom, reason=msg[:120], worker_slot=worker_slot)
+                    if retry_action == "block":
+                        gptmail_block_domain(dom, reason=msg[:120], worker_slot=worker_slot)
                     if dom_try < domain_tries:
                         alog(
                             attempt,
-                            f"domain blocked → retry {dom_try + 1}/{domain_tries} with a new mailbox",
+                            f"disposable retry → {dom_try + 1}/{domain_tries} with a new mailbox",
                         )
                         continue
-                    emit_failed(attempt, f"domain blocked after {domain_tries} tries: {msg[:160]}")
+                    emit_failed(attempt, f"disposable retries exhausted after {domain_tries} tries: {msg[:160]}")
                     await save_failed_to_file(attempt, email_addr, msg)
                     return None
                 if (
@@ -5292,11 +5414,13 @@ async def main() -> None:
         print("[CFG] email_mode=generator api=https://generator.email", flush=True)
     elif EMAIL_MODE == "tempmail":
         slog("CFG", f"email_mode=tempmail provider={TEMPMAIL_PROVIDER} api={TEMPMAIL_API}")
+    elif EMAIL_MODE == "emailqu":
+        print(f"[CFG] email_mode=emailqu domain_pin={EMAILQU_DOMAIN or '-'}", flush=True)
     else:
         if not IMAP_USER or not IMAP_PASS:
             print(
                 "ERROR: set ENTER_IMAP_USER + ENTER_IMAP_PASS in .env "
-                "(or ENTER_EMAIL_MODE=gptmail|tempmail)",
+                "(or use a disposable ENTER_EMAIL_MODE)",
                 flush=True,
             )
             sys.exit(1)
