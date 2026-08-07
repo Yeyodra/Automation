@@ -129,6 +129,7 @@ class PostAuthSetupTests(unittest.TestCase):
             "RuntimeError: API POST /workspaces/1/api-keys returned 500": ("api_key_failed", "api_key"),
             "RuntimeError: callback not reached: unknown": ("callback_failed", "callback"),
             "RuntimeError: gateway session missing user": ("session_invalid", "session"),
+            "RuntimeError: Too many signup attempts (after_password)": ("rate_limited", "rate"),
         }
         for error, expected in cases.items():
             with self.subTest(error=error):

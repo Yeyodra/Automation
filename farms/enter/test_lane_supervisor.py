@@ -9,6 +9,7 @@ from farms.enter.lane_supervisor import (
     classify_outcome,
     load_scheduler_state,
     normalize_domains,
+    outcome_cooldown_seconds,
     parse_blocked_domains,
     read_terminal_outcome,
     read_terminal_status,
@@ -153,6 +154,11 @@ class LaneSupervisorTests(unittest.TestCase):
             parse_blocked_domains("bad.test # explicit rejection\nother.test reason text\n"),
             {"bad.test", "other.test"},
         )
+
+    def test_rate_limit_uses_short_contextual_cooldown(self):
+        self.assertEqual(outcome_cooldown_seconds("rate_limited", 900, 120), 120)
+        self.assertEqual(outcome_cooldown_seconds("access_denied", 900, 120), 900)
+        self.assertEqual(outcome_cooldown_seconds("ok", 900, 120), 0)
 
     def test_contextual_scheduler_prefers_recent_lane_success_without_blacklisting(self):
         queue = ["bad.test", "good.test", "unknown.test"]

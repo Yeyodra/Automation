@@ -25,7 +25,7 @@ TERMINAL_CATEGORIES = {
     "password_stalled", "access_denied", "callback_failed",
     "session_invalid", "referral_claim_failed_nonfatal", "workspace_missing",
     "onboarding_failed", "api_key_failed", "nvrouter_push_failed",
-    "account_timeout", "other",
+    "account_timeout", "rate_limited", "other",
 }
 SECRET_FIELDS = {"email", "password", "otp", "token", "api_key", "cookie", "code", "state"}
 
@@ -157,6 +157,14 @@ def select_contextual_domain(queue: list[str], cooldowns: dict[str, float],
         selected = max(available, key=score)
     queue.append(queue.pop(queue.index(selected)))
     return selected
+
+
+def outcome_cooldown_seconds(category: str, ambiguous: int, min_reuse: int) -> int:
+    if category == "ok":
+        return 0
+    if category == "rate_limited":
+        return max(30, min_reuse)
+    return ambiguous
 
 
 def terminate_process_group(child: subprocess.Popen) -> str:
@@ -323,7 +331,9 @@ def main() -> None:
                 with blocked_file.open("a") as handle:
                     handle.write(domain + "\n")
         elif category != "ok":
-            cooldowns[domain] = time.time() + args.cooldown
+            cooldowns[domain] = time.time() + outcome_cooldown_seconds(
+                category, args.cooldown, max(0, args.min_reuse)
+            )
         row = stats.setdefault(domain, {"ok": 0, "ambiguous": 0, "recent": []})
         if category == "ok":
             row["ok"] = int(row.get("ok", 0)) + 1

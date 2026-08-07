@@ -5216,6 +5216,7 @@ def _terminal_category(error: str) -> tuple[str, str]:
         ("turnstile_failed", "turnstile", ("turnstile", "captcha")),
         ("password_stalled", "password", ("password_stalled", "password stall")),
         ("account_timeout", "account", ("account timeout",)),
+        ("rate_limited", "rate", ("too many signup attempts", "rate limit", "try again later")),
         ("api_key_failed", "api_key", ("api key", "api-key", "apikey", "api-keys")),
         ("workspace_missing", "workspace", ("workspace",)),
         ("session_invalid", "session", ("gateway session", "session invalid", "unauthenticated")),
