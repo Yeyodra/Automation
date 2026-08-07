@@ -1,28 +1,40 @@
-﻿# Enter / Converge farm
+# Enter / Converge farm
 
-Port of Coverage/enter-farm. Email default: **gptmail** (no IMAP).
+The Enter farm creates a mailbox, completes the official browser signup flow, creates an `ek_` API key, and sends the finished credential to NvRouter.
 
-| Item | Value |
-|------|--------|
-| Job | `enter` / `enter-farm` |
-| Prefix | `ENTER_` |
-| Email | `gptmail` default (override `ENTER_EMAIL_MODE`) |
-| WARP | hub `core.warp` everyN 1:1 `-c` |
+Read [OPERATIONS.md](OPERATIONS.md) before deploying or changing production. It is the current source of truth for:
 
-## Hub `.env`
+- the referral, FingerprintJS, risk-session, Auth0, callback, and post-auth flow;
+- Emailqu mailbox and domain handling;
+- permanent blacklist versus temporary lane cooldown rules;
+- isolated multi-lane production;
+- WARP proxy affinity;
+- native key-only NvRouter delivery;
+- fresh VPS setup, monitoring, and troubleshooting.
 
-```env
-ENTER_EMAIL_MODE=gptmail
-ENTER_GIFT_CODE=XXXX
-ENTER_HEADLESS=false
-# shared GPTMAIL_* maps → ENTER_GPTMAIL_*
-GPTMAIL_API=https://mail.chatgpt.org.uk
+`VPS-DEPLOY.md`, `HTTP_MIGRATION.md`, and parts of `CHANGELOG.md` contain historical experiments. Do not copy old host addresses, passwords, Xvfb commands, legacy 9router settings, or single-identity c3/c4 recommendations from those files.
+
+## Current entry points
+
+```text
+farm.py             One account flow and direct single-process runner
+lane_supervisor.py  Serial lane with domain rotation and strict block attribution
 ```
 
-Keep `EMAIL_MODE=domain` for grok/outlook if needed — enter uses **ENTER_EMAIL_MODE** override.
+Run tests from the repository root:
 
-## Run
-
-```powershell
-python -m jobs run enter -- -n 1 -c 1 -y --headed
+```bash
+python3 -m unittest -q \
+  farms.enter.test_lane_supervisor \
+  farms.enter.test_auth_gateway \
+  farms.enter.test_post_auth \
+  core.test_ninerouter
 ```
+
+Basic single-account dry run:
+
+```bash
+python3 -m jobs run enter --dry-run --warp-every-n 1 -- -n 1 -c 1 -y --headless
+```
+
+A production lane must keep internal concurrency at one. Aggregate c2 or higher by running multiple isolated lane supervisors with different referrals and sticky proxies, not by raising one farm process to `-c 2` or `-c 4`.

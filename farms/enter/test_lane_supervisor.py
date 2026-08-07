@@ -1,10 +1,15 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from farms.enter.lane_supervisor import (
+    FARM_RESULTS_SENTINEL,
     classify_outcome,
     normalize_domains,
     parse_blocked_domains,
+    resolve_blocked_file,
+    secure_runtime_paths,
     select_domain,
     terminate_process_group,
     validate_lane,
@@ -61,6 +66,26 @@ class LaneSupervisorTests(unittest.TestCase):
         output = terminate_process_group(child)
         self.assertEqual(output, "done")
         self.assertEqual(killpg.call_count, 3)
+
+    def test_blocklist_defaults_to_farm_results_and_accepts_env_override(self):
+        self.assertEqual(
+            resolve_blocked_file({}),
+            FARM_RESULTS_SENTINEL,
+        )
+        self.assertEqual(
+            resolve_blocked_file({"ENTER_BLOCKED_DOMAINS_FILE": "/tmp/custom-blocked.txt"}),
+            Path("/tmp/custom-blocked.txt"),
+        )
+
+    def test_runtime_paths_are_private(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "lane-a-state.json"
+            log = root / "production-lane-a.log"
+            secure_runtime_paths(root, state, log)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

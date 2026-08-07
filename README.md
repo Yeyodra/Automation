@@ -1,6 +1,6 @@
 # Automation Hub
 
-Pusat runner untuk project farm (Grok, nanti Enter, dll.).  
+Pusat runner untuk project farm (Grok, Enter, Outlook, dan provider lain).
 **Env + Python deps + WARP every-N + progress = global di hub**; farm hanya logic produk.
 
 ## Quick start
@@ -37,6 +37,7 @@ HUD: **everyN** live-syncs to **-c** when everyN≠0. Counter = OK only; drain p
 | **[docs/ADD-PROVIDER.md](./docs/ADD-PROVIDER.md)** | **Agents:** add new farm / provider + wire global systems |
 | **[docs/ENV-AND-DEPS.md](./docs/ENV-AND-DEPS.md)** | Env global vs local, venv, Camoufox, WARP |
 | `farms/grok/README.md` | Grok product flow |
+| **[farms/enter/OPERATIONS.md](./farms/enter/OPERATIONS.md)** | Enter auth flow, Emailqu domains, isolated lanes, NvRouter, deployment |
 | `core/warp.py` | `python -m core.warp status\|rotate` |
 | `core/progress.py` | Log contract for OK/fail progress |
 
@@ -49,6 +50,7 @@ Automation/
 ├── core/          # env, warp, warp_policy, progress  (GLOBAL)
 ├── jobs/          # registry + runner
 ├── farms/grok/    # provider
+├── farms/enter/   # Enter browser signup + isolated lane supervisor
 ├── app.py         # HUD
 └── docs/
 ```

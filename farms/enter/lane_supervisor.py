@@ -10,9 +10,23 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
 FARM = ROOT / "farms/enter"
+FARM_RESULTS_SENTINEL = FARM / "results/gptmail_blocked_domains.txt"
+
+
+def resolve_blocked_file(env: Mapping[str, str]) -> Path:
+    return Path(env.get("ENTER_BLOCKED_DOMAINS_FILE") or FARM_RESULTS_SENTINEL)
+
+
+def secure_runtime_paths(directory: Path, state_file: Path, log_file: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    for path in (state_file, log_file):
+        path.touch(mode=0o600, exist_ok=True)
+        path.chmod(0o600)
 
 
 def validate_lane(lane: str) -> str:
@@ -91,15 +105,18 @@ def main() -> None:
     parser.add_argument("--cooldown", type=int, default=900)
     args = parser.parse_args()
 
-    blocked_file = FARM / "gptmail_blocked_domains.txt"
+    blocked_file = resolve_blocked_file(os.environ)
+    blocked_file.parent.mkdir(parents=True, exist_ok=True)
     lane = validate_lane(args.lane)
     catalog = Path(args.domains).read_text().splitlines()
     queue = normalize_domains(args.preferred + catalog)
     if not queue:
         raise SystemExit("no valid domains")
     cooldowns: dict[str, float] = {}
-    state_file = FARM / f"lane-{lane}-state.json"
-    log_file = FARM / f"production-lane-{lane}.log"
+    runtime_dir = FARM / "results/lanes"
+    state_file = runtime_dir / f"lane-{lane}-state.json"
+    log_file = runtime_dir / f"production-lane-{lane}.log"
+    secure_runtime_paths(runtime_dir, state_file, log_file)
 
     while True:
         now = time.time()

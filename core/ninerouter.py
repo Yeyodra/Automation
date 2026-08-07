@@ -10,9 +10,9 @@ Usage:
     pusher.flush()
 
 Env (hub .env):
-    NINEROUTER_VPS_HOST    — SSH host (default: 43.156.135.115)
+    NINEROUTER_VPS_HOST    — SSH host (required)
     NINEROUTER_VPS_USER    — SSH user (default: ubuntu)
-    NINEROUTER_VPS_PW      — SSH password
+    NINEROUTER_VPS_PW      — SSH password for legacy mode (no default; prefer key-command mode)
     NINEROUTER_VPS_DB      — remote DB path (default: /home/ubuntu/.9router/db/data.sqlite)
     NINEROUTER_VPS_SQLITE  — remote better-sqlite3 path
 """
@@ -43,9 +43,9 @@ def _env(key: str, default: str = "") -> str:
 
 
 # Defaults
-_DEFAULT_HOST = "43.156.135.115"
+_DEFAULT_HOST = ""
 _DEFAULT_USER = "ubuntu"
-_DEFAULT_PW = "Bintang_088"
+_DEFAULT_PW = ""
 _DEFAULT_DB = "/home/ubuntu/.9router/db/data.sqlite"
 _DEFAULT_SQLITE = "/home/ubuntu/scripts/grok-refresh/node_modules/better-sqlite3"
 
@@ -202,6 +202,9 @@ class NinerouterPusher:
             if not out.get("ok"):
                 raise RuntimeError(str(out.get("error") or out)[:300])
             pushed = int(out.get("accounts", 0))
+            skipped = int(out.get("skipped", 0))
+            if pushed != len(batch) or skipped or out.get("errors"):
+                raise RuntimeError(f"incomplete native import: {out}"[:300])
             self._pushed += pushed
             _log(f"[NVROUTER] pushed {pushed} account(s)")
             return True
