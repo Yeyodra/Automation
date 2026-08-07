@@ -485,7 +485,13 @@ def main() -> None:
         }
         write_private_json(state_file, state)
         print(json.dumps(state), flush=True)
-        time.sleep(args.gap)
+        # Post-OK velocity cooldown: Auth0/Enter denies signups <115s after a
+        # successful signup from the same referral/proxy identity. min_reuse
+        # (default 120s) is the proven safe inter-signup gap (handoff: 2/2 OK).
+        post_sleep = args.gap
+        if category == "ok":
+            post_sleep = max(args.gap, args.min_reuse)
+        time.sleep(post_sleep)
 
 
 if __name__ == "__main__":
