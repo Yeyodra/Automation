@@ -9,6 +9,8 @@ from farms.enter.lane_supervisor import (
     claim_domain_lease,
     classify_outcome,
     global_start_wait,
+    shared_heat_wait,
+    trip_shared_heat,
     load_scheduler_state,
     normalize_domains,
     outcome_cooldown_seconds,
@@ -156,6 +158,14 @@ class LaneSupervisorTests(unittest.TestCase):
             parse_blocked_domains("bad.test # explicit rejection\nother.test reason text\n"),
             {"bad.test", "other.test"},
         )
+
+    def test_shared_heat_breaker_pauses_both_lanes_after_denial(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "shared-heat.json"
+            self.assertEqual(shared_heat_wait(path, now=1000), 0)
+            trip_shared_heat(path, 300, now=1000)
+            self.assertEqual(shared_heat_wait(path, now=1100), 200)
+            self.assertEqual(shared_heat_wait(path, now=1301), 0)
 
     def test_cross_lane_domain_lease_prevents_identity_collision(self):
         with TemporaryDirectory() as directory:

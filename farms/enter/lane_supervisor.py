@@ -160,6 +160,24 @@ def select_contextual_domain(queue: list[str], cooldowns: dict[str, float],
     return selected
 
 
+def shared_heat_wait(path: Path, now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        until = float(data.get("until", 0)) if isinstance(data, dict) else 0
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+    if not math.isfinite(until):
+        return 0
+    return max(0, int(until - current + 0.999))
+
+
+def trip_shared_heat(path: Path, cooldown: int, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    existing = shared_heat_wait(path, current)
+    write_private_json(path, {"version": 1, "until": max(current + cooldown, current + existing)})
+
+
 def claim_domain_lease(path: Path, domain: str, lane: str, ttl: int,
                        now: float | None = None) -> bool:
     if ttl <= 0:
@@ -323,6 +341,7 @@ def main() -> None:
     parser.add_argument("--explore-every", type=int, default=5)
     parser.add_argument("--global-start-gap", type=int, default=0)
     parser.add_argument("--cross-lane-domain-lease", type=int, default=300)
+    parser.add_argument("--shared-heat-cooldown", type=int, default=300)
     args = parser.parse_args()
 
     blocked_file = resolve_blocked_file(os.environ)
@@ -346,6 +365,10 @@ def main() -> None:
     attempt_number, stats, last_used, cooldowns = load_scheduler_state(persisted)
 
     while True:
+        heat_file = runtime_dir / "shared-heat.json"
+        heat_wait = shared_heat_wait(heat_file)
+        if heat_wait:
+            time.sleep(heat_wait)
         now = time.time()
         blocked = parse_blocked_domains(blocked_file.read_text()) if blocked_file.exists() else set()
         attempt_number += 1
@@ -411,6 +434,8 @@ def main() -> None:
             cooldowns[domain] = time.time() + outcome_cooldown_seconds(
                 category, args.cooldown, max(0, args.min_reuse)
             )
+        if category == "access_denied" and args.shared_heat_cooldown > 0:
+            trip_shared_heat(heat_file, args.shared_heat_cooldown)
         row = stats.setdefault(domain, {"ok": 0, "ambiguous": 0, "recent": []})
         if category == "ok":
             row["ok"] = int(row.get("ok", 0)) + 1
