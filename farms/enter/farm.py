@@ -653,6 +653,8 @@ _used_emails: set[str] = set()
 _proxy_lock = asyncio.Lock()
 _proxy_pool: list[tuple[str, str]] = []
 _proxy_idx = 0
+# threading lock for the sync risk-session proxy picker (runs in a worker thread)
+_risk_proxy_lock = threading.Lock()
 _turnstile_sem: asyncio.Semaphore | None = None
 _claimed_otps_sync: set[str] = set()
 _claimed_otps_lock = threading.Lock()
@@ -1053,6 +1055,29 @@ async def extract_fpjs(page, attempt: int, *, force: bool = False) -> tuple[str,
 
 
 # ── Risk session (bypass Auth0 risk_control_blocked) ─────────────────────────
+# proxy pinned to the account currently being registered (browser + risk-session
+# must egress from the SAME IP). Set in _do_register_body; cleared in finally.
+_current_proxy: str | None = None
+
+
+def _risk_session_proxy() -> str | None:
+    """Proxy for the risk-session POST — same IP as the account's browser.
+
+    The risk-session POST MUST egress from the same IP as the browser signup —
+    otherwise api.enter.pro rate-limits the local/WARP IP after the first account,
+    or the FPJS/IP pair mismatches with multiple proxies.
+    """
+    if _current_proxy:
+        return _current_proxy
+    if not _proxy_pool:
+        return None
+    with _risk_proxy_lock:
+        global _proxy_idx
+        url, _ = _proxy_pool[_proxy_idx % len(_proxy_pool)]
+        _proxy_idx += 1
+    return url
+
+
 def _get_risk_session_id(invite_code: str = "", fpjs_visitor_id: str = "", fpjs_event_id: str = "") -> str | None:
     """Get risk_session_id from Enter API.
 
@@ -1075,6 +1100,12 @@ def _get_risk_session_id(invite_code: str = "", fpjs_visitor_id: str = "", fpjs_
     if invite_code:
         body["invite_code"] = invite_code
     data = json.dumps(body).encode()
+    proxy = _risk_session_proxy()
+    opener = (
+        urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        if proxy
+        else urllib.request.build_opener()
+    )
     last_err = ""
     for attempt_i in range(3):
         try:
@@ -1089,7 +1120,7 @@ def _get_risk_session_id(invite_code: str = "", fpjs_visitor_id: str = "", fpjs_
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 },
             )
-            resp = urllib.request.urlopen(req, timeout=13)
+            resp = opener.open(req, timeout=13)
             return json.loads(resp.read())["data"]["risk_session_id"]
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
@@ -5536,7 +5567,9 @@ async def save_failed_to_file(attempt: int, email: str, err: str) -> None:
 
 # ── Register one ─────────────────────────────────────────────────────────────
 async def _do_register_body(attempt: int, email_addr: str, password: str, proxy_url: str | None, proxy_id: str) -> dict:
+    global _current_proxy
     manager = None
+    _current_proxy = proxy_url or None
     try:
         if AUTH_MODE != "browser":
             raise RuntimeError("ENTER_AUTH_MODE must be browser")
@@ -5580,6 +5613,7 @@ async def _do_register_body(attempt: int, email_addr: str, password: str, proxy_
             "enter": enter_meta,
         }
     finally:
+        _current_proxy = None
         if manager is not None:
             try:
                 await manager.__aexit__(None, None, None)
