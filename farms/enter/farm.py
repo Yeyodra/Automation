@@ -973,12 +973,108 @@ async def raise_if_rate_limited(page, attempt: int, where: str) -> None:
     raise RuntimeError(f"Too many signup attempts ({where}): {reason}")
 
 
+# ── Real FPJS device fingerprint (anti-abuse: risk-session MUST carry it) ─────
+# HAR-proven: successful signups forward the REAL visitor_id + event_id produced
+# by the live FingerprintJS agent on the page. Random locally-generated ids make
+# Auth0 /authorize/resume deny the signup (error=access_denied -> /auth/callback
+# 403). Cache per-run: the fingerprint is device-stable and risk-session +
+# /authorize must agree on the same pair.
+FPJS_API_KEY = "u6yR5spJIPnoeOSRkRYI"
+FPJS_ENDPOINT = "https://fpjs.converge.ai"
+FPJS_SCRIPT = f"{FPJS_ENDPOINT}/web/v4/{FPJS_API_KEY}"
+_fpjs_cache: dict[str, str] = {}
+_fpjs_lock = threading.Lock()
+
+
+def _get_fpjs_pair() -> tuple[str, str]:
+    with _fpjs_lock:
+        return _fpjs_cache.get("vid", ""), _fpjs_cache.get("eid", "")
+
+
+def _set_fpjs_pair(vid: str, eid: str) -> None:
+    if not vid or not eid:
+        return
+    with _fpjs_lock:
+        _fpjs_cache["vid"] = vid
+        _fpjs_cache["eid"] = eid
+
+
+async def extract_fpjs(page, attempt: int, *, force: bool = False) -> tuple[str, str]:
+    """Extract the REAL FingerprintJS visitor_id + event_id from the live page.
+
+    HAR-proven (app JS bundle): the app imports the FPJS agent module and calls
+    start({apiKey, region:'ap', endpoints:'https://fpjs.converge.ai'}).get()
+    which returns { event_id, visitor_id } — the exact pair POSTed to
+    /auth/risk-session (e.g. event_id="1786061539199.ytS37s",
+    visitor_id="f8KUy00n4saPaFPPYNe9"). Random locally-generated ids make Auth0
+    /authorize/resume deny the signup (access_denied). Cached per-run so every
+    risk-session / authorize call agrees on the same device identity.
+    """
+    if not force:
+        vid, eid = _get_fpjs_pair()
+        if vid and eid:
+            return vid, eid
+    last = ""
+    for try_i in range(2):
+        try:
+            raw = await page.evaluate(
+                """async () => {
+                    const key = 'u6yR5spJIPnoeOSRkRYI';
+                    const url = 'https://fpjs.converge.ai/web/v4/' + key + '?ci=jsl/4.1.2';
+                    const mod = await import(url);
+                    const agent = await mod.start({
+                        apiKey: key,
+                        region: 'ap',
+                        endpoints: 'https://fpjs.converge.ai'
+                    });
+                    const result = await agent.get({timeout: 12000});
+                    return JSON.stringify({
+                        vid: result.visitor_id || '',
+                        eid: result.event_id || ''
+                    });
+                }"""
+            )
+            import json as _json
+
+            data = _json.loads(raw)
+            vid = data.get("vid") or ""
+            eid = data.get("eid") or ""
+            if vid and eid and vid not in ("not_loaded", "error") and eid not in ("not_loaded", "error"):
+                _set_fpjs_pair(vid, eid)
+                alog(attempt, f"FPJS real device fingerprint (vid={len(vid)} eid={len(eid)})")
+                return vid, eid
+            last = raw
+            alog(attempt, f"FPJS extraction incomplete (try {try_i + 1}): {raw[:120]}")
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+            alog(attempt, f"FPJS extract error (try {try_i + 1}): {last[:120]}")
+        await asyncio.sleep(1.5)
+    return _get_fpjs_pair()
+
+
 # ── Risk session (bypass Auth0 risk_control_blocked) ─────────────────────────
-def _get_risk_session_id() -> str | None:
-    """Get risk_session_id from Enter API. Accepts random FPJS data."""
-    vid = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
-    eid = f"{int(time.time() * 1000)}.{''.join(secrets.choice(string.ascii_letters) for _ in range(6))}"
-    data = json.dumps({"fp_event_id": eid, "visitor_id": vid, "platform": "web"}).encode()
+def _get_risk_session_id(invite_code: str = "", fpjs_visitor_id: str = "", fpjs_event_id: str = "") -> str | None:
+    """Get risk_session_id from Enter API.
+
+    MUST carry the REAL FPJS visitor_id/event_id from the browser. Random ids are
+    the known cause of Auth0 /authorize/resume access_denied. Falls back to random
+    only as a last resort and logs loudly so it is never silent.
+    """
+    vid = fpjs_visitor_id or ""
+    eid = fpjs_event_id or ""
+    if not vid or not eid:
+        print(
+            "[RISK] WARNING: risk-session without real FPJS pair "
+            f"(vid={'ok' if vid else 'missing'} eid={'ok' if eid else 'missing'}) — "
+            "Auth0 will likely deny this signup (access_denied).",
+            flush=True,
+        )
+        vid = vid or "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
+        eid = eid or f"{int(time.time() * 1000)}.{''.join(secrets.choice(string.ascii_letters) for _ in range(6))}"
+    body = {"fp_event_id": eid, "visitor_id": vid, "platform": "web"}
+    if invite_code:
+        body["invite_code"] = invite_code
+    data = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{API_HOST}/code/api/v1/auth/risk-session",
         data=data,
@@ -991,7 +1087,7 @@ def _get_risk_session_id() -> str | None:
         },
     )
     try:
-        resp = urllib.request.urlopen(req, timeout=10)
+        resp = urllib.request.urlopen(req, timeout=13)
         return json.loads(resp.read())["data"]["risk_session_id"]
     except Exception:
         return None
@@ -1084,8 +1180,9 @@ def do_signup_http(email_addr: str, password: str, attempt: int, otp_func) -> di
     )
     alog(attempt, f"http-auth: turnstile ok (len={len(ts_token)})")
 
-    # 2. risk_session_id
-    rs_id = _get_risk_session_id()
+    # 2. risk_session_id — use the REAL FPJS pair captured from the browser page
+    fpjs_vid, fpjs_eid = _get_fpjs_pair()
+    rs_id = _get_risk_session_id(fpjs_visitor_id=fpjs_vid, fpjs_event_id=fpjs_eid)
     alog(attempt, f"http-auth: risk_session={'ok' if rs_id else 'fail'}")
 
     # 3. /authorize -> get state + cookies
@@ -1468,17 +1565,23 @@ def _http_json(url: str, data: dict | None = None, headers: dict | None = None, 
 
 
 def _tempmail_pick_domain() -> str:
-    """GET /domains from mail.tm — returns first active public domain."""
+    """GET /domains from mail.tm — first active public domain NOT Auth0-blocked.
+
+    Never pick a domain already rejected by Auth0 (gptmail_blocked_domains.txt):
+    every mailbox created on it is wasted before signup is even attempted.
+    """
     data = _http_json(f"{TEMPMAIL_API}/domains")
     members = data if isinstance(data, list) else (data.get("hydra:member") or data.get("member") or [])
     if not members:
         raise RuntimeError("tempmail: no domains from API")
+    with _gptmail_lock:
+        blocked = set(_gptmail_blocked_domains)
     for d in members:
         if isinstance(d, dict) and d.get("isActive", True) and not d.get("isPrivate", False):
-            dom = d.get("domain") or ""
-            if dom:
+            dom = (d.get("domain") or "").lower()
+            if dom and dom not in blocked:
                 return dom
-    # fallback first
+    # fallback first (all blocked — let caller surface the error downstream)
     d0 = members[0]
     dom = d0.get("domain") if isinstance(d0, dict) else str(d0)
     if not dom:
@@ -2100,6 +2203,9 @@ def _exzork_host() -> str:
     base = (EXZORK_DOMAIN or "").strip().lower().lstrip("@").lstrip("*.")
     if not base:
         raise RuntimeError("ENTER_EXZORK_DOMAIN required for exzork mode")
+    with _gptmail_lock:
+        if base in _gptmail_blocked_domains:
+            raise RuntimeError(f"exzork: base domain {base} is Auth0-blocked")
     if not EXZORK_WILDCARD:
         return base
     # random subdomain under claimed *.base (anti-block rotate)
@@ -2333,7 +2439,14 @@ def create_emailqu_inbox() -> str:
     domains = _emailqu_apex_domains()
     if EMAILQU_DOMAIN and EMAILQU_DOMAIN not in domains:
         raise RuntimeError("emailqu: pinned domain is not a public apex domain")
-    domain = EMAILQU_DOMAIN or random.choice(domains)
+    if EMAILQU_DOMAIN:
+        domain = EMAILQU_DOMAIN
+    else:
+        # never pick an Auth0-blocked domain (wasted mailbox otherwise)
+        with _gptmail_lock:
+            blocked = set(_gptmail_blocked_domains)
+        free = [d for d in domains if d not in blocked]
+        domain = random.choice(free or domains)
     _, verified, _ = _emailqu_get(f"/api/domain/verify/{quote(domain, safe='')}")
     if not verified.get("verified"):
         raise RuntimeError(f"emailqu: domain not verified: {domain}")
@@ -2963,7 +3076,7 @@ async def wait_otp_imap_keepalive(
                         'input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]'
                     ).first
                     if await loc.count() > 0 and await loc.is_visible():
-                        await loc.click(timeout=1000)
+                        await loc.click(timeout=1300)
                 except Exception:
                     pass
         except Exception as e:
@@ -3431,19 +3544,20 @@ async def launch_browser(proxy_url: str | None):
 
         manager = async_playwright()
         playwright = await manager.__aenter__()
-        launch: dict[str, Any] = {"headless": HEADLESS}
+        launch: dict[str, Any] = {"headless": HEADLESS, "args": ["--ignore-certificate-errors"]}
         if BROWSER_EXECUTABLE:
             launch["executable_path"] = BROWSER_EXECUTABLE
         if proxy_url:
             launch["proxy"] = _parse_proxy(proxy_url)
         browser = await playwright.chromium.launch(**launch)
-        page = await browser.new_page(locale="en-US")
+        page = await browser.new_page(locale="en-US", ignore_https_errors=True)
         if LOW_BANDWIDTH:
             await _enable_low_bandwidth(page)
         page.set_default_timeout(max(60000, GOTO_TIMEOUT_MS + 15000))
         return manager, browser, page
 
     kwargs: dict[str, Any] = {
+        "args": ["--ignore-certificate-errors"],
         "headless": HEADLESS,
         "humanize": 0.5,
         "os": CAMOUFOX_OS if CAMOUFOX_OS in {"windows", "macos", "linux"} else "linux",
@@ -4125,30 +4239,39 @@ async def _fetch_gateway_session(page) -> dict:
 
 async def _click_official_login_action(page, timeout: float = 12.0) -> bool:
     deadline = time.monotonic() + timeout
+    # Landing can be served localized (/es etc.) — match EN + ES CTAs.
+    # "Iniciar sesi" prefix (no ó) survives the mojibake on the /es page.
+    cta_re = re.compile(
+        r"^(Get Free Credits|Empezar a construir|Construir ahora|"
+        r"Iniciar sesi|Try Free Build Your Custom AI Agent)$",
+        re.I,
+    )
+    consent_re = re.compile(r"^(Reject All|Accept All|Got It|Aceptar|Entendido|Cerrar)$", re.I)
     while time.monotonic() < deadline:
-        for text in ("Reject All", "Accept All", "Got It"):
-            try:
-                consent = page.get_by_role("button", name=re.compile(f"^{re.escape(text)}$", re.I))
-                if await consent.count() and await consent.first.is_visible():
-                    await consent.first.click(timeout=1500)
-            except Exception:
-                pass
+        try:
+            consent = page.get_by_role("button", name=consent_re)
+            for index in range(await consent.count()):
+                btn = consent.nth(index)
+                if await btn.is_visible():
+                    await btn.click(timeout=1500)
+        except Exception:
+            pass
         try:
             invite = page.get_by_role("dialog").filter(
-                has_text=re.compile(r"You've got an invite", re.I)
+                has_text=re.compile(r"You've got an invite|Tienes una invitaci", re.I)
             )
             for index in range(await invite.count()):
                 dialog = invite.nth(index)
                 if not await dialog.is_visible():
                     continue
-                close = dialog.get_by_role("button", name="Close", exact=True)
+                close = dialog.get_by_role("button", name=re.compile(r"^Close$|^Cerrar$", re.I))
                 if await close.count() and await close.first.is_visible():
                     await close.first.click(timeout=3000, no_wait_after=True)
                     await dialog.wait_for(state="hidden", timeout=3000)
         except Exception:
             pass
         try:
-            locator = page.get_by_role("button", name=re.compile(r"^Get Free Credits$", re.I))
+            locator = page.get_by_role("button", name=cta_re)
             for index in range(await locator.count()):
                 button = locator.nth(index)
                 if await button.is_visible():
@@ -4157,7 +4280,7 @@ async def _click_official_login_action(page, timeout: float = 12.0) -> bool:
         except Exception:
             pass
         try:
-            locator = page.get_by_text(re.compile(r"^Get Free Credits$", re.I), exact=True)
+            locator = page.get_by_text(cta_re, exact=True)
             for index in range(await locator.count()):
                 target = locator.nth(index)
                 if await target.is_visible():
@@ -4199,12 +4322,11 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
     if INVITER:
         q["inviter"] = INVITER
     land = f"{APP_HOST}/?{urlencode(q)}"
-    alog(attempt, "landing")
-    await goto_with_retry(page, land, attempt, label="landing")
+
     await asyncio.sleep(3.0)
 
-    # The landing action owns FPJS risk preflight and gateway PKCE. If the app
-    # fails open without navigating, use only its same-origin gateway fallback.
+    # Use the app CTA first because it owns PKCE. If it fails open, reproduce
+    # the HAR contract: real FPJS pair -> risk-session -> /auth/login with ID.
     for login_try in range(2):
         started = await _click_official_login_action(page)
         if started:
@@ -4214,9 +4336,32 @@ async def do_signup_and_oauth(page, email_addr: str, password: str, attempt: int
             break
         except asyncio.TimeoutError:
             if login_try:
-                raise RuntimeError("risk-aware gateway login not observed")
+                # HAR contract: real FPJS pair -> risk-session -> /auth/login with ID.
+                # extract_fpjs reuses the cached device fingerprint (fresh only if missing).
+                fpjs_vid, fpjs_eid = await extract_fpjs(page, attempt)
+                if not (fpjs_vid and fpjs_eid):
+                    alog(attempt, "FPJS from page not available, trying fallback")
+                rs_id = await asyncio.to_thread(
+                    _get_risk_session_id, GIFT_CODE, fpjs_vid, fpjs_eid
+                )
+                if not rs_id:
+                    raise RuntimeError("risk-session creation failed")
+                login_url = f"{APP_HOST}/auth/login?{urlencode({'return_to': '/', 'risk_session_id': rs_id})}"
+                await goto_with_retry(
+                    page, login_url, attempt, label="gateway_fallback", warp_on_fail=False
+                )
+                # Auth0 redirects /auth/login -> /authorize -> /u/login|signup
+                # The on_response handler already sets login_seen on /auth/login
+                try:
+                    await asyncio.wait_for(login_seen.wait(), timeout=13)
+                    break
+                except asyncio.TimeoutError:
+                    raise RuntimeError("gateway fallback did not reach login")
             await goto_with_retry(page, land, attempt, label="landing_retry")
             await asyncio.sleep(3.0)
+            # Cache the real device fingerprint once the app page is up, so the
+            # fallback above and any recovery /authorize use the same identity.
+            await extract_fpjs(page, attempt)
     await asyncio.sleep(1.5)
 
     # Prefer signup over login
@@ -4733,7 +4878,9 @@ async def _dismiss_app_modals(page) -> None:
 async def _start_authorize(page, challenge: str, email_addr: str, attempt: int, *, prompt: str | None = "login") -> None:
     """Navigate to Auth0 /authorize with OUR PKCE (must match token exchange verifier)."""
     state = secrets.token_urlsafe(24)
-    rs_id = _get_risk_session_id()
+    # Same REAL device fingerprint as the risk-session that authorized this device
+    fpjs_vid, fpjs_eid = _get_fpjs_pair()
+    rs_id = _get_risk_session_id(fpjs_visitor_id=fpjs_vid, fpjs_event_id=fpjs_eid)
     params = {
         "client_id": CLIENT_ID,
         "scope": SCOPE,
@@ -5020,7 +5167,7 @@ def inject_to_9router(api_key: str, workspace_id: str, email: str = "", name: st
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     try:
-        conn = sqlite3.connect(str(db_path), timeout=10)
+        conn = sqlite3.connect(str(db_path), timeout=13)
         cur = conn.cursor()
 
         # Dedup: same provider + same apiKey already in data JSON

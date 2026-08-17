@@ -124,7 +124,7 @@ class OfficialGatewayBoundaryTests(unittest.TestCase):
         self.assertIn("Get Free Credits", source)
         self.assertIn("get_by_text", source)
         self.assertIn("You've got an invite", source)
-        self.assertIn('name="Close"', source)
+        self.assertIn('^Close$|^Cerrar$', source)
         self.assertIn('wait_for(state="hidden"', source)
         self.assertIn('evaluate("element => element.click()")', source)
         self.assertIn("Reject All", source)
