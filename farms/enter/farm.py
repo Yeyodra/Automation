@@ -1075,22 +1075,31 @@ def _get_risk_session_id(invite_code: str = "", fpjs_visitor_id: str = "", fpjs_
     if invite_code:
         body["invite_code"] = invite_code
     data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"{API_HOST}/code/api/v1/auth/risk-session",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Origin": APP_HOST,
-            "Referer": f"{APP_HOST}/",
-            "Accept": "application/json, text/plain, */*",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-    )
-    try:
-        resp = urllib.request.urlopen(req, timeout=13)
-        return json.loads(resp.read())["data"]["risk_session_id"]
-    except Exception:
-        return None
+    last_err = ""
+    for attempt_i in range(3):
+        try:
+            req = urllib.request.Request(
+                f"{API_HOST}/code/api/v1/auth/risk-session",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": APP_HOST,
+                    "Referer": f"{APP_HOST}/",
+                    "Accept": "application/json, text/plain, */*",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                },
+            )
+            resp = urllib.request.urlopen(req, timeout=13)
+            return json.loads(resp.read())["data"]["risk_session_id"]
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            print(
+                f"[RISK] risk-session POST fail (try {attempt_i + 1}/3): {last_err[:160]}",
+                flush=True,
+            )
+            time.sleep(1.5 + attempt_i * 1.5)
+    print(f"[RISK] risk-session creation failed: {last_err[:200]}", flush=True)
+    return None
 
 
 # ── BYCF Turnstile solver (pure HTTP, no browser) ───────────────────────────
@@ -1581,12 +1590,10 @@ def _tempmail_pick_domain() -> str:
             dom = (d.get("domain") or "").lower()
             if dom and dom not in blocked:
                 return dom
-    # fallback first (all blocked — let caller surface the error downstream)
-    d0 = members[0]
-    dom = d0.get("domain") if isinstance(d0, dict) else str(d0)
-    if not dom:
-        raise RuntimeError(f"tempmail: bad domains payload {str(data)[:200]}")
-    return dom
+    raise RuntimeError(
+        f"tempmail: no usable (non-blocked) domain from API "
+        f"(domains={len(members)} blocked={len(blocked)})"
+    )
 
 
 def create_tempmail_account() -> str:
@@ -1908,6 +1915,14 @@ def gptmail_block_domain(domain: str, reason: str = "", worker_slot: int | None 
             for s, d in list(_gptmail_slot_domain.items()):
                 if d == dom:
                     _gptmail_slot_domain.pop(s, None)
+    # also drop the emailqu sticky pin for this domain
+    with _emailqu_domains_lock:
+        if worker_slot is not None and _emailqu_slot_domain.get(worker_slot) == dom:
+            _emailqu_slot_domain.pop(worker_slot, None)
+        else:
+            for s, d in list(_emailqu_slot_domain.items()):
+                if d == dom:
+                    _emailqu_slot_domain.pop(s, None)
     if not already:
         _persist_blocked_domain(dom, reason)
     print(
@@ -2374,6 +2389,10 @@ def read_otp_from_exzork_sync(
 
 _emailqu_domains: list[str] = []
 _emailqu_domains_lock = threading.Lock()
+# sticky domain per worker slot: reuse a working domain (swap prefix only);
+# rotate to a new one only when Auth0 blocks the current domain.
+_emailqu_slot_domain: dict[int, str] = {}
+_emailqu_domain_rr = 0
 
 
 def _emailqu_get(path: str, etag: str = "") -> tuple[int, dict, str]:
@@ -2428,7 +2447,47 @@ def _emailqu_apex_domains() -> list[str]:
         return list(_emailqu_domains)
 
 
-def create_emailqu_inbox() -> str:
+def _emailqu_pick_domain(worker_slot: int | None = None) -> str:
+    """Sticky domain per worker slot for emailqu.
+
+    Reuse one working domain (just swap the prefix per account) instead of
+    rotating every account. Only rotate when Auth0 rejects the current domain
+    ('not allowed to sign up') — gptmail_block_domain clears the slot pin.
+    """
+    domains = _emailqu_apex_domains()
+    if EMAILQU_DOMAIN:
+        if EMAILQU_DOMAIN not in domains:
+            raise RuntimeError("emailqu: pinned domain is not a public apex domain")
+        return EMAILQU_DOMAIN
+    with _gptmail_lock:
+        blocked = set(_gptmail_blocked_domains)
+    if worker_slot is None:
+        free = [d for d in domains if d not in blocked]
+        return random.choice(free or domains)
+    with _emailqu_domains_lock:
+        global _emailqu_domain_rr
+        cur = _emailqu_slot_domain.get(worker_slot)
+        if cur and cur not in blocked and cur in domains:
+            return cur
+        used = {d for s, d in _emailqu_slot_domain.items() if s != worker_slot}
+        candidates = (
+            [d for d in domains if d not in blocked and d not in used]
+            or [d for d in domains if d not in blocked]
+            or list(domains)
+        )
+        idx = _emailqu_domain_rr % len(candidates)
+        _emailqu_domain_rr += 1
+        chosen = candidates[idx]
+        _emailqu_slot_domain[worker_slot] = chosen
+        print(
+            f"[EMAILQU] slot={worker_slot} sticky domain={chosen} "
+            f"(blocked={len(blocked)})",
+            flush=True,
+        )
+        return chosen
+
+
+def create_emailqu_inbox(worker_slot: int | None = None) -> str:
     if EMAILQU_PREFIX:
         username = EMAILQU_PREFIX + _crypto_local_part(10)
     else:
@@ -2436,17 +2495,7 @@ def create_emailqu_inbox() -> str:
         username = re.sub(r"[^a-z0-9]", "", str(data.get("username") or "").lower())
         if not username:
             raise RuntimeError("emailqu: random username missing")
-    domains = _emailqu_apex_domains()
-    if EMAILQU_DOMAIN and EMAILQU_DOMAIN not in domains:
-        raise RuntimeError("emailqu: pinned domain is not a public apex domain")
-    if EMAILQU_DOMAIN:
-        domain = EMAILQU_DOMAIN
-    else:
-        # never pick an Auth0-blocked domain (wasted mailbox otherwise)
-        with _gptmail_lock:
-            blocked = set(_gptmail_blocked_domains)
-        free = [d for d in domains if d not in blocked]
-        domain = random.choice(free or domains)
+    domain = _emailqu_pick_domain(worker_slot)
     _, verified, _ = _emailqu_get(f"/api/domain/verify/{quote(domain, safe='')}")
     if not verified.get("verified"):
         raise RuntimeError(f"emailqu: domain not verified: {domain}")
@@ -2591,7 +2640,7 @@ def _rotation_candidates() -> list[str]:
     return [p for p in TEMPMAIL_ROTATION if p in supported]
 
 
-def create_rotating_inbox() -> str:
+def create_rotating_inbox(worker_slot: int | None = None) -> str:
     global _rotating_mail_idx
     providers = _rotation_candidates()
     if not providers:
@@ -2608,7 +2657,7 @@ def create_rotating_inbox() -> str:
                     from generator_email import create_inbox
                     address, token = create_inbox(), ""
                 elif provider == "emailqu":
-                    address, token = create_emailqu_inbox(), ""
+                    address, token = create_emailqu_inbox(worker_slot), ""
                 elif provider == "exzork":
                     address, token = create_exzork_inbox(), ""
                 elif provider == "mail.tm":
@@ -2658,7 +2707,9 @@ async def generate_email(worker_slot: int | None = None) -> str:
     async with _emails_lock:
         for _ in range(200):
             if EMAIL_MODE == "rotate":
-                addr = await asyncio.get_event_loop().run_in_executor(None, create_rotating_inbox)
+                addr = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: create_rotating_inbox(worker_slot)
+                )
                 key = addr.lower()
                 if key not in _used_emails:
                     _used_emails.add(key)
@@ -2677,7 +2728,9 @@ async def generate_email(worker_slot: int | None = None) -> str:
                     return addr
                 continue
             if EMAIL_MODE == "emailqu":
-                addr = await asyncio.get_event_loop().run_in_executor(None, create_emailqu_inbox)
+                addr = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: create_emailqu_inbox(worker_slot)
+                )
                 key = addr.lower()
                 if key not in _used_emails:
                     _used_emails.add(key)
@@ -5714,6 +5767,14 @@ async def main() -> None:
             sys.exit(1)
         if EMAIL_MODE == "domain" and not EMAIL_DOMAIN:
             print("ERROR: set ENTER_EMAIL_DOMAIN for domain mode", flush=True)
+            sys.exit(1)
+        if EMAIL_MODE == "domain" and EMAIL_DOMAIN and "example" in EMAIL_DOMAIN.lower():
+            print(
+                "ERROR: ENTER_EMAIL_DOMAIN is a placeholder "
+                f"('{EMAIL_DOMAIN}') — set a real catch-all domain (or use "
+                "ENTER_EMAIL_MODE=rotate/tempmail/emailqu/gptmail).",
+                flush=True,
+            )
             sys.exit(1)
     # WARP connect/pre-rotate: hub runner (python -m jobs run --warp-*)
     slog(

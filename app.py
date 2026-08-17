@@ -265,6 +265,7 @@ class HubApp(App[None]):
                     yield Button("IMAP", id="btn-email-imap", variant="success")
                     yield Button("GPTMail", id="btn-email-gptmail", variant="default")
                     yield Button("Exzork", id="btn-email-exzork", variant="default")
+                    yield Button("Rotate", id="btn-email-rotate", variant="default")
                     yield Label("  (grok/enter)", id="email-hint")
                 # Inject target: local 9router DB vs VPS merge push (grok + grok-reauth)
                 with Horizontal(id="inject-row", classes="row"):
@@ -363,7 +364,9 @@ class HubApp(App[None]):
         except Exception:
             hub = {}
         shared = (hub.get("EMAIL_MODE") or "domain").strip().lower()
-        _ok = ("domain", "plus_trick", "gptmail", "exzork")
+        # HUD buttons only cover domain/gptmail/exzork, but enter supports
+        # disposable modes too (rotate/tempmail/emailqu/generator) — preserve them.
+        _ok = ("domain", "plus_trick", "gptmail", "exzork", "rotate", "tempmail", "emailqu", "generator")
         for jid, key, default in (
             (
                 "grok",
@@ -374,14 +377,11 @@ class HubApp(App[None]):
         ):
             raw = (hub.get(key) or default or "domain").strip().lower()
             if raw not in _ok:
-                raw = default if default in ("domain", "gptmail", "exzork") else "domain"
-            # HUD: domain | gptmail | exzork (plus_trick → IMAP/domain button)
-            if raw == "gptmail":
-                self._email_mode[jid] = "gptmail"
-            elif raw == "exzork":
-                self._email_mode[jid] = "exzork"
-            else:
-                self._email_mode[jid] = "domain"
+                raw = default if default in _ok else "domain"
+            # plus_trick → IMAP/domain button; other valid modes preserved as-is
+            if raw == "plus_trick":
+                raw = "domain"
+            self._email_mode[jid] = raw
 
     def _seed_gift_from_env(self) -> None:
         try:
@@ -407,9 +407,9 @@ class HubApp(App[None]):
         jid = self._job_id()
         if jid not in self._EMAIL_TOGGLE_JOBS:
             return
-        if mode not in ("domain", "gptmail", "exzork"):
+        if mode not in ("domain", "gptmail", "exzork", "rotate"):
             return
-        # Exzork is grok-only for now (enter stays gptmail/domain)
+        # Exzork is grok-only for now (enter stays gptmail/domain/rotate)
         if mode == "exzork" and jid != "grok":
             self._status("Exzork: grok only")
             return
@@ -419,6 +419,7 @@ class HubApp(App[None]):
             "gptmail": "GPTMail (API)",
             "exzork": "Exzork (API)",
             "domain": "IMAP (domain)",
+            "rotate": "Rotate (mail.tm/emailqu)",
         }.get(mode, mode)
         self._status(f"{jid} email: {label}")
         self._log(f"[hub] {jid} EMAIL_MODE → {mode}")
@@ -435,6 +436,10 @@ class HubApp(App[None]):
         row.set_class(not show, "hidden")
         try:
             self.query_one("#btn-email-exzork", Button).display = jid == "grok"
+        except Exception:
+            pass
+        try:
+            self.query_one("#btn-email-rotate", Button).display = jid == "enter"
         except Exception:
             pass
         if show:
@@ -536,9 +541,11 @@ class HubApp(App[None]):
             btn_imap = self.query_one("#btn-email-imap", Button)
             btn_gpt = self.query_one("#btn-email-gptmail", Button)
             btn_exz = self.query_one("#btn-email-exzork", Button)
+            btn_rot = self.query_one("#btn-email-rotate", Button)
             btn_imap.variant = "success" if mode == "domain" else "default"
             btn_gpt.variant = "success" if mode == "gptmail" else "default"
             btn_exz.variant = "success" if mode == "exzork" else "default"
+            btn_rot.variant = "success" if mode == "rotate" else "default"
         except Exception:
             pass
 
@@ -643,6 +650,12 @@ class HubApp(App[None]):
         if self._job_id() not in self._EMAIL_TOGGLE_JOBS:
             return
         self._set_email_mode("exzork")
+
+    @on(Button.Pressed, "#btn-email-rotate")
+    def on_email_rotate(self) -> None:
+        if self._job_id() not in self._EMAIL_TOGGLE_JOBS:
+            return
+        self._set_email_mode("rotate")
 
     def _parse_int_field(self, field_id: str, default: int = 1) -> int:
         try:
