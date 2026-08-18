@@ -21,6 +21,7 @@ import asyncio
 import base64
 import hashlib
 import imaplib
+import ipaddress
 import json
 import os
 import random
@@ -780,6 +781,8 @@ async def _maybe_warp_after_success(attempt: int) -> None:
     Wave mode: block new starts, drain peers, rotate once, settle, resume.
     """
     global _success_since_warp, _warp_drain_owner
+    if _proxy_pool:
+        return
     every = _effective_warp_every_n()
     if every <= 0:
         return
@@ -865,7 +868,7 @@ async def _trip_rate_limit(attempt: int, reason: str) -> None:
 
     # Prefer hub WARP reconnect over long idle cooldown
     rotated = False
-    if WARP_ON_RATE_LIMIT:
+    if WARP_ON_RATE_LIMIT and not _proxy_pool:
         try:
             rotated = await warp_rotate_ip_async(attempt)
         except Exception as e:
@@ -1388,7 +1391,7 @@ def _load_proxy_pool() -> list[tuple[str, str]]:
     if file_path:
         pool.extend(_load_proxy_file(Path(file_path)))
     else:
-        default = _ROOT / "proxies.txt"
+        default = next((p for p in (_ROOT / "proxy.txt", _ROOT / "proxies.txt") if p.is_file()), _ROOT / "proxy.txt")
         if default.is_file():
             pool.extend(_load_proxy_file(default))
     extra = _env("ENTER_PROXY_POOL")
@@ -3578,7 +3581,7 @@ async def goto_with_retry(
                 await page.evaluate("() => { try { window.stop(); } catch (e) {} }")
             except Exception:
                 pass
-            if warp_on_fail and GOTO_WARP_ON_FAIL and navish and not warped:
+            if warp_on_fail and GOTO_WARP_ON_FAIL and not _proxy_pool and navish and not warped:
                 alog(attempt, f"{label} WARP rotate")
                 try:
                     await warp_rotate_ip_async(attempt)
@@ -3640,13 +3643,20 @@ async def launch_browser(proxy_url: str | None):
         page.set_default_timeout(max(60000, GOTO_TIMEOUT_MS + 15000))
         return manager, browser, page
 
+    proxy_ip: str | bool = False
+    if proxy_url:
+        try:
+            proxy_ip = str(ipaddress.ip_address(urlparse(proxy_url).hostname or ""))
+        except ValueError:
+            pass
     kwargs: dict[str, Any] = {
         "args": ["--ignore-certificate-errors"],
         "headless": HEADLESS,
         "humanize": 0.5,
         "os": CAMOUFOX_OS if CAMOUFOX_OS in {"windows", "macos", "linux"} else "linux",
         "locale": "en-US",
-        "geoip": True,
+        # Pass literal proxy IP to avoid Camoufox's 5-second proxy preflight.
+        "geoip": proxy_ip if proxy_url else True,
         "block_webrtc": True,
     }
     if proxy_url:
