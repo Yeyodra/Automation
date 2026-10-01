@@ -1,0 +1,15 @@
+# Proxy pool for enter-v3-google — one proxy per line, round-robin per account.
+# This file is gitignored.
+#
+# multi-warp output (warp-pool.txt) drops in verbatim:
+#   socks5://127.0.0.1:40001
+#   socks5://127.0.0.1:40002
+# ...
+#
+# Other accepted formats:
+#   socks5://user:pass@host:port
+#   http://user:pass@host:port
+#   host:port
+#
+# One account = one sticky proxy: browser + risk-session + post-auth all use it.
+# Empty/absent file => every account egresses from the local IP.

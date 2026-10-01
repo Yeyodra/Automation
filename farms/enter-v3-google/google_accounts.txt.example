@@ -1,0 +1,10 @@
+# Google account pool for the enter-v3-google farm.
+# One account per line:  email|password   (also accepts email:password or email<TAB>password)
+# Lines starting with # are ignored.
+#
+# Accounts already farmed are recorded in results/used_google.txt and skipped.
+# Replace the sample below with real accounts (or point ENTER_GOOGLE_ACCOUNTS elsewhere).
+#
+# Example:
+# user1@gmail.com|MyPassword123
+# user2@yourdomain.com|AnotherPass456
