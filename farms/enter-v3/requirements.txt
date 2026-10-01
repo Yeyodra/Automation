@@ -1,0 +1,2 @@
+# minimal — no farm-local venv; deps live in the hub root
+# this file is documentation only
