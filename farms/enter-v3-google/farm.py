@@ -530,20 +530,32 @@ async def _click_first(page, selectors, *, timeout: int = 4000, scroll: bool = F
     return False
 
 
-async def _fill_google_field(page, selectors, value: str, attempt: int, label: str) -> bool:
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count() == 0 or not await loc.is_visible():
+async def _fill_google_field(
+    page, selectors, value: str, attempt: int, label: str, timeout: float = 20.0
+) -> bool:
+    """Type into the first visible matching field, polling until timeout.
+
+    Google renders each interstitial asynchronously, so the field often does not
+    exist yet when the URL already changed. A single immediate attempt makes the
+    run die with "could not fill google password" while the page is still loading.
+    """
+    deadline = time.monotonic() + max(1.0, timeout)
+    while True:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() == 0 or not await loc.is_visible():
+                    continue
+                await loc.click(timeout=4000)
+                await loc.fill("")
+                await loc.type(value, delay=random.randint(25, 60))
+                alog(attempt, f"google {label} filled via {sel}")
+                return True
+            except Exception:
                 continue
-            await loc.click(timeout=4000)
-            await loc.fill("")
-            await loc.type(value, delay=random.randint(25, 60))
-            alog(attempt, f"google {label} filled via {sel}")
-            return True
-        except Exception:
-            continue
-    return False
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.5)
 
 
 async def _click_google_next(page, attempt: int) -> None:
