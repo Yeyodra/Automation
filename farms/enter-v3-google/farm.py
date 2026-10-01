@@ -151,6 +151,9 @@ GLOBAL_KEYS_TXT = Path(_env("ENTER_GLOBAL_KEYS", str(RESULTS_ROOT / "all_apikeys
 USED_GOOGLE_FILE = Path(
     _env("ENTER_GOOGLE_USED_FILE", str(RESULTS_ROOT / "used_google.txt"))
 )
+GOOGLE_DEAD_FILE = Path(
+    _env("ENTER_GOOGLE_DEAD_FILE", str(RESULTS_ROOT / "google_dead.txt"))
+)
 
 # ── Proxy pool (multi-warp SOCKS5 / any proxy) ────────────────────────────────
 # Farm-local on purpose: legacy _load_proxy_pool() resolves paths against
@@ -420,6 +423,24 @@ def _load_used_google() -> set[str]:
 
 def _persist_used_google(email: str) -> None:
     _append(USED_GOOGLE_FILE, email.lower())
+
+
+def _is_access_denied(msg: str) -> bool:
+    """Google refused the OAuth request for this account.
+
+    Not a farm bug and not retryable: retrying the same account just burns a
+    fresh browser session and the proxy IP's reputation. Mark it used instead so
+    later runs skip it.
+    """
+    low = (msg or "").lower()
+    return "access_denied" in low or "access denied" in low
+
+
+def _mark_google_dead(email: str, reason: str) -> None:
+    if not email:
+        return
+    _persist_used_google(email)
+    _append(GOOGLE_DEAD_FILE, f"{email.lower()}\t{reason[:160]}")
 
 
 # ── Browser auth (Google OAuth) ───────────────────────────────────────────────
@@ -1055,7 +1076,11 @@ async def do_account(
         return None
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
-        emit_failed(attempt, msg, email)
+        if _is_access_denied(msg):
+            emit_failed(attempt, "access_denied (Google refused; marking dead, no retry)", email)
+            _mark_google_dead(email, msg)
+        else:
+            emit_failed(attempt, msg, email)
         try:
             await L.save_failed_to_file(attempt, email, msg)
         except Exception:
