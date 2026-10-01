@@ -173,10 +173,18 @@ _chain_lock = asyncio.Lock()
 _chain_next_gift = ""
 _chain_used: set[str] = set()
 _chain_index = 0
+_chain_tip: dict[str, str] = {}
+
+
+def _invite_url(code: str, name: str = "") -> str:
+    q = {"gift": code, "inviteeReward": INVITEE_REWARD}
+    if name:
+        q["inviter"] = name
+    return f"{L.APP_HOST}/?{urlencode(q)}"
 
 
 def _load_chain_state() -> None:
-    global _chain_next_gift, _chain_index
+    global _chain_next_gift, _chain_index, _chain_tip
     if not CHAIN_STATE_FILE.is_file():
         return
     try:
@@ -190,6 +198,9 @@ def _load_chain_state() -> None:
     used = st.get("used_codes")
     if isinstance(used, list):
         _chain_used.update(str(c).strip() for c in used if str(c).strip())
+    tip = st.get("tip")
+    if isinstance(tip, dict) and tip.get("code"):
+        _chain_tip = {k: str(v) for k, v in tip.items()}
 
 
 def _save_chain_state() -> None:
@@ -199,9 +210,42 @@ def _save_chain_state() -> None:
         "next_gift": _chain_next_gift,
         "index": _chain_index,
         "used_codes": sorted(_chain_used),
+        "tip": _chain_tip,
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     CHAIN_STATE_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _emit_chain_tip(label: str = "TIP") -> None:
+    """Log the newest account's referral code so it can seed a future pool.
+
+    The tip is the LAST farmed account's own code: nothing has claimed it yet, so
+    it is the correct gift for the next Google account added to the pool.
+    """
+    code = _chain_tip.get("code") or _chain_next_gift
+    if not code:
+        return
+    name = _chain_tip.get("name", "")
+    email = _chain_tip.get("email", "")
+    url = _invite_url(code, name)
+    slog("CHAIN", f"{label} referral for the next Google account:")
+    slog("CHAIN", f"  code : {code}")
+    slog("CHAIN", f"  link : {url}")
+    if email:
+        slog("CHAIN", f"  from : {email}")
+    tip_file = RESULTS_ROOT / "referral_tip.txt"
+    try:
+        tip_file.parent.mkdir(parents=True, exist_ok=True)
+        tip_file.write_text(
+            f"code={code}\n"
+            f"link={url}\n"
+            f"from={email}\n"
+            f"name={name}\n"
+            f"updated_at={datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 async def _chain_claim_gift(attempt: int) -> str:
@@ -235,10 +279,17 @@ async def _chain_claim_gift(attempt: int) -> str:
         return gift
 
 
-async def _chain_advance(attempt: int, gift: str, own_code: str, landed: bool | None) -> None:
+async def _chain_advance(
+    attempt: int,
+    gift: str,
+    own_code: str,
+    landed: bool | None,
+    name: str = "",
+    email: str = "",
+) -> None:
     if not GIFT_CHAIN:
         return
-    global _chain_next_gift, _chain_index
+    global _chain_next_gift, _chain_index, _chain_tip
     async with _chain_lock:
         _chain_used.add(gift)
         _chain_index += 1
@@ -251,6 +302,7 @@ async def _chain_advance(attempt: int, gift: str, own_code: str, landed: bool | 
             else:
                 slog("CHAIN", f"#{_chain_index} link ok: {gift} -> next {own_code}")
             _chain_next_gift = own_code
+            _chain_tip = {"code": own_code, "name": name, "email": email}
         _save_chain_state()
 
 
@@ -1022,7 +1074,10 @@ async def do_account(
         own_code = str(meta.get("referral_code") or "")
         credits_total = meta.get("credits_total")
         bonus_landed = meta.get("invitee_bonus_landed")
-        await _chain_advance(attempt, gift, own_code, bonus_landed)
+        await _chain_advance(
+            attempt, gift, own_code, bonus_landed,
+            name=str(meta.get("user_name") or ""), email=email,
+        )
         if bonus_landed is False:
             emit_progress(
                 attempt, "CREDITS",
@@ -1030,6 +1085,11 @@ async def do_account(
             )
         elif bonus_landed is True:
             emit_progress(attempt, "CREDITS", f"bonus landed (total={credits_total})", email)
+        if GIFT_CHAIN and own_code:
+            emit_progress(
+                attempt, "TIP",
+                f"newest referral {own_code} (use for the next Google account)", email,
+            )
 
         result = {
             "google_email": email,
@@ -1038,6 +1098,7 @@ async def do_account(
             "password": google_pw,
             "gift_code": gift,
             "referral_code": own_code,
+            "user_name": meta.get("user_name"),
             "credits_total": credits_total,
             "invitee_bonus_landed": bonus_landed,
             "variant": "enter-v3-google",
@@ -1231,6 +1292,8 @@ async def main() -> None:
             slog("9ROUTER", f"flush error: {type(e).__name__}: {e}")
 
     ok = len(results)
+    if GIFT_CHAIN:
+        _emit_chain_tip("TIP")
     slog("DONE", f"ok={ok}/{n} batch={BATCH_DIR}")
     print(f"[DONE] ok={ok}/{n} batch={BATCH_DIR}", flush=True)
     try:

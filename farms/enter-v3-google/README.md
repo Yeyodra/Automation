@@ -137,6 +137,26 @@ config. Akun induk seed (`prayoga1`) juga naik 100 → 200. State rantai di
 `results/referral_chain.json` (resume antar-run). Kalau rantai putus, default
 lanjut pakai seed (`ENTER_GIFT_CHAIN_FALLBACK=1`); set `0` untuk gagal keras.
 
+### Referral tip — seed buat akun Google berikutnya
+
+Tiap run, akun **terakhir** yang sukses dicatat sebagai **tip**. Code-nya belum
+diklaim siapa pun, jadi itu gift yang benar untuk akun Google berikutnya yang lo
+tambahkan ke pool. Muncul di log:
+
+```
+[CHAIN] TIP referral for the next Google account:
+[CHAIN]   code : X7KAVIQYNV
+[CHAIN]   link : https://enter.converge.ai/?gift=X7KAVIQYNV&inviteeReward=100&inviter=...
+[CHAIN]   from : mala5@gpspindwaal.com
+```
+
+Juga ditulis ke `results/referral_tip.txt` (`code=`, `link=`, `from=`, `name=`)
+dan per-akun di log: `[n] TIP  newest referral <CODE> (use for the next Google account)`.
+
+Jadi alurnya: habiskan pool → ambil tip → set `ENTER_GIFT_CODE` ke tip itu (atau
+biarkan rantai resume otomatis, karena `next_gift` = tip) → tambah Google baru →
+lanjut.
+
 ## Proxy pool — multi-warp (handle "too many signup")
 
 Auth0 rate-limit itu **per-IP**, jadi N akun dari 1 IP bakal kena

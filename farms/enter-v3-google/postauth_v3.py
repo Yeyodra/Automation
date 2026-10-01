@@ -249,6 +249,7 @@ def post_auth_setup(
     user_obj = udata.get("user") if isinstance(udata.get("user"), dict) else {}
     out["referral_code"] = str(user_obj.get("referral_code") or "").strip()
     out["user_id"] = str(user_obj.get("user_id") or "").strip()
+    out["user_name"] = str(user_obj.get("name") or "").strip()
 
     # 3. workspace — fail closed if none
     ws_resp = get_workspaces(access_token, proxy=proxy)
