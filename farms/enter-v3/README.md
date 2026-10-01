@@ -180,6 +180,21 @@ Satu akun = satu baris `OK` di stdout (buat progress HUD). Output batch di
 global append-only. `accounts.json` menyimpan `referral_code`, `credits_total`,
 dan `invitee_bonus_landed` per akun.
 
+## Cartethyia Postgres inject
+
+Setiap `ek_` key yang sukses langsung di-upsert ke Postgres Cartethyia
+(`provider_accounts`, provider id `enterconverge`), jadi key baru langsung
+routable tanpa import manual. Farm tetap menulis txt/json seperti biasa.
+
+Implementasi: `core/cartethyia.py` (shared — dipakai juga oleh `enter-v3-google`).
+`credential_ciphertext` = AES-256-GCM (`iv(12)‖authTag(16)‖ct`) dengan
+`CARTETHYIA_ENCRYPTION_KEY`; `credential_fingerprint` = `HMAC-SHA256(key, secret)`;
+`auth_state.workspaceId` = workspace id numerik. Verifikasi byte-compatible
+dilakukan dengan mendekripsi row yang sudah ada di DB.
+
+**Fail-soft** (DB mati / key hilang → warning, farm lanjut) dan **idempoten**
+(key sama tidak bikin row kembar). Matikan: `ENTER_CARTETHYIA_INJECT=0`.
+
 ## Env (lihat `.env.example`)
 
 Hub `.env` menang (`load_dotenv(override=False)`). Wajib ada `ENTER_GIFT_CODE`
@@ -188,6 +203,7 @@ HAR-proven: `founder / just_me / other`.
 
 Kunci rantai: `ENTER_GIFT_CHAIN`, `ENTER_GIFT_CHAIN_FALLBACK`, `ENTER_CHAIN_STATE`.
 Kunci verifikasi bonus: `ENTER_BASE_SIGNUP_CREDITS`, `ENTER_REFERRAL_BONUS_TOTAL`.
+Kunci inject: `ENTER_CARTETHYIA_INJECT`, `ENTER_CARTETHYIA_ENV_FILE`.
 
 ## Yang TIDAK dipakai
 

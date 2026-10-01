@@ -157,9 +157,34 @@ Jadi alurnya: habiskan pool → ambil tip → set `ENTER_GIFT_CODE` ke tip itu (
 biarkan rantai resume otomatis, karena `next_gift` = tip) → tambah Google baru →
 lanjut.
 
-## Proxy pool — multi-warp (handle "too many signup")
+## Cartethyia Postgres inject
 
-Auth0 rate-limit itu **per-IP**, jadi N akun dari 1 IP bakal kena
+Setiap `ek_` key yang sukses **langsung** di-upsert ke Postgres Cartethyia
+(`provider_accounts`, provider id `enterconverge`) — jadi key baru langsung
+routable tanpa import manual. Selain itu farm tetap menulis txt/json seperti biasa.
+
+Implementasi: `core/cartethyia.py` (shared, dipakai juga oleh `enter-v3`).
+
+Yang harus cocok dengan Cartethyia (kalau tidak, row-nya tidak terpakai):
+
+| Kolom | Isi |
+|---|---|
+| `credential_ciphertext` | AES-256-GCM, layout `iv(12)‖authTag(16)‖ct`, key `CARTETHYIA_ENCRYPTION_KEY` |
+| `credential_fingerprint` | `HMAC-SHA256(key, secret)` hex — sama dengan `hashSecret()` |
+| `auth_state.workspaceId` | workspace id numerik (adapter baca dari sini) |
+| `tenant_id` | `NULL` = shared pool-wide (memang begitu untuk key hasil farm) |
+
+Kredensial + `DATABASE_URL` dibaca dari `Cartethyia\.env`
+(override: `CARTETHYIA_ENCRYPTION_KEY`, `CARTETHYIA_DATABASE_URL`/`DATABASE_URL`,
+atau `CARTETHYIA_ENV_FILE`).
+
+**Fail-soft:** driver tidak ada / DB mati / key tidak ada → warning saja, farm
+tetap mencatat hasilnya. Upsert idempoten: key yang sama tidak bikin row kembar
+(unique index `(provider_id, coalesce(tenant_id), credential_fingerprint)`).
+
+Matikan dengan `ENTER_CARTETHYIA_INJECT=0`.
+
+## Proxy pool — multi-warp (handle "too many signup")Auth0 rate-limit itu **per-IP**, jadi N akun dari 1 IP bakal kena
 `Too many signup attempts`. Farm ini round-robin proxy pool, **satu akun = satu
 proxy sticky** (browser + risk-session + post-auth satu egress).
 
