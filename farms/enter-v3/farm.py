@@ -562,6 +562,9 @@ CHAIN_STATE_FILE = Path(
     _env("ENTER_CHAIN_STATE", str(RESULTS_ROOT / "referral_chain.json"))
 )
 
+# Push each successful ek_ key straight into Cartethyia's provider_accounts.
+CARTETHYIA_INJECT = _env_int("ENTER_CARTETHYIA_INJECT", 1) > 0
+
 BATCH_ID = ""
 BATCH_DIR: Path = RESULTS_ROOT
 RESULTS_JSON: Path = RESULTS_ROOT / "accounts.json"
@@ -690,6 +693,23 @@ def _append(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 
+def _inject_cartethyia(api_key: str, workspace_id: str, email: str) -> None:
+    """Best-effort push into Cartethyia's Postgres; never breaks the farm."""
+    if not CARTETHYIA_INJECT:
+        return
+    try:
+        from core.cartethyia import inject_account
+
+        inject_account(
+            api_key=api_key,
+            workspace_id=str(workspace_id or ""),
+            label=email or "",
+            log=lambda m: slog("CARTETHYIA", m),
+        )
+    except Exception as e:
+        slog("CARTETHYIA", f"inject error: {type(e).__name__}: {e}")
+
+
 def init_batch(n: int, c: int) -> str:
     global BATCH_ID, BATCH_DIR, RESULTS_JSON, CREDS_TXT, CREDS_KEYS_TXT
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -761,6 +781,8 @@ async def save_result(result: dict) -> None:
         if key:
             _append(GLOBAL_KEYS_TXT, f"{key}\t{email}\t{ws}\t{BATCH_ID}")
         slog("SAVE", f"{email} ws={ws} key={key[:12]}... -> {CREDS_TXT}")
+    if key:
+        await asyncio.to_thread(_inject_cartethyia, key, ws, email)
 
 
 async def _push_ninerouter(result: dict) -> bool:
