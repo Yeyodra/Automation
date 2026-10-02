@@ -1,0 +1,17 @@
+# Proxy pool for the Railway farm, one proxy per line.
+# This file is gitignored.
+#
+# Sticky: 1 account = 1 egress. The browser (OAuth) and every post-auth GraphQL
+# call use the same proxy, so Railway/Google see one consistent IP per account.
+#
+# multi-warp output (warp-pool.txt) drops in verbatim:
+#   socks5://127.0.0.1:40001
+#   socks5://127.0.0.1:40002
+# ...
+#
+# Other accepted formats:
+#   socks5://user:pass@host:port
+#   http://user:pass@host:port
+#   host:port
+#
+# Empty/absent file => every account egresses from the local IP.

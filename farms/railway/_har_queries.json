@@ -1,0 +1,32 @@
+{
+  "platformStatus": {
+    "query": "query platformStatus {\n  platformStatus {\n    ...PlatformStatusFields\n  }\n}\n\nfragment PlatformStatusFields on PlatformStatus {\n  isStable\n  incident {\n    ...IncidentFields\n  }\n  maintenance {\n    ...MaintenanceFields\n  }\n}\n\nfragment IncidentFields on Incident {\n  id\n  message\n  status\n  url\n}\n\nfragment MaintenanceFields on Maintenance {\n  id\n  message\n  status\n  url\n  start\n}",
+    "variables": null
+  },
+  "me": {
+    "query": "query me {\n  me {\n    ...UserFields\n  }\n}\n\nfragment UserFields on User {\n  id\n  email\n  name\n  username\n  avatar\n  profile {\n    ...UserProfileFields\n  }\n  isAdmin\n  isConductor\n  createdAt\n  flags\n  featureFlags\n  agreedFairUse\n  termsAgreedOn\n  isVerified\n  banReason\n  providerAuths {\n    edges {\n      node {\n        id\n        provider\n        isAuthEnabled\n        metadata\n        email\n      }\n    }\n  }\n  workspaces {\n    ...WorkspaceFields\n  }\n}\n\nfragment UserProfileFields on UserProfile {\n  bio\n  website\n  isPublic\n}\n\nfragment WorkspaceFields on Workspace {\n  id\n  plan\n  subscriptionPlanLimit\n  name\n  avatar\n  customer {\n    id\n    state\n    isTrialing\n    spendCommitment {\n      features\n      minSpendAmountCents\n    }\n  }\n  hasSAML\n  hasHipaaBAA\n  has2FAEnforcement\n  hasAutomaticDiagnosis\n  redactedDueTo2FAPending\n  discordRole\n  banReason\n  restriction {\n    id\n    type\n    reason\n    allowsUserAppeal\n    activeAppeal {\n      id\n      type\n      status\n      createdAt\n      threadId\n    }\n    workspaceAppeal {\n      id\n      status\n      createdAt\n      submittedBy {\n        id\n        email\n        name\n      }\n    }\n    viewerAppeal {\n      id\n      type\n      status\n      createdAt\n    }\n  }\n  slackChannelId\n  preferredRegion\n  createdAt\n  currentSessionHasAccess\n  viewerRole\n  projects {\n    edges {\n      node {\n        id\n        name\n        isPublic\n        deletedAt\n      }\n    }\n  }\n}",
+    "variables": null
+  },
+  "workspace": {
+    "query": "query workspace($workspaceId: String!) {\n  workspace(workspaceId: $workspaceId) {\n    agentsConfigEnabled\n    customer {\n      ...CustomerFields\n    }\n  }\n}\n\nfragment CustomerFields on Customer {\n  id\n  state\n  isUsageSubscriber\n  isTrialing\n  stripeCustomerId\n  isPrepaying\n  hasExhaustedFreePlan\n  usageLimit {\n    ...UsageLimitFields\n  }\n  billingPeriod {\n    start\n    end\n  }\n}\n\nfragment UsageLimitFields on UsageLimit {\n  softLimit\n  hardLimit\n}",
+    "variables": {
+      "workspaceId": "abfa740d-452e-45a7-b64b-071028dfe348"
+    }
+  },
+  "freePlanBalance": {
+    "query": "query freePlanBalance($workspaceId: String!) {\n  workspace(workspaceId: $workspaceId) {\n    customer {\n      ...FreePlanBalanceFields\n    }\n  }\n}\n\nfragment FreePlanBalanceFields on Customer {\n  remainingUsageCreditBalance\n  trialDaysRemaining\n  volumeDeletionScheduledAt\n}",
+    "variables": {
+      "workspaceId": "abfa740d-452e-45a7-b64b-071028dfe348"
+    }
+  },
+  "userTermsUpdate": {
+    "query": "mutation userTermsUpdate {\n  userTermsUpdate {\n    ...UserFields\n  }\n}\n\nfragment UserFields on User {\n  id\n  email\n  name\n  username\n  avatar\n  profile {\n    ...UserProfileFields\n  }\n  isAdmin\n  isConductor\n  createdAt\n  flags\n  featureFlags\n  agreedFairUse\n  termsAgreedOn\n  isVerified\n  banReason\n  providerAuths {\n    edges {\n      node {\n        id\n        provider\n        isAuthEnabled\n        metadata\n        email\n      }\n    }\n  }\n  workspaces {\n    ...WorkspaceFields\n  }\n}\n\nfragment UserProfileFields on UserProfile {\n  bio\n  website\n  isPublic\n}\n\nfragment WorkspaceFields on Workspace {\n  id\n  plan\n  subscriptionPlanLimit\n  name\n  avatar\n  customer {\n    id\n    state\n    isTrialing\n    spendCommitment {\n      features\n      minSpendAmountCents\n    }\n  }\n  hasSAML\n  hasHipaaBAA\n  has2FAEnforcement\n  hasAutomaticDiagnosis\n  redactedDueTo2FAPending\n  discordRole\n  banReason\n  restriction {\n    id\n    type\n    reason\n    allowsUserAppeal\n    activeAppeal {\n      id\n      type\n      status\n      createdAt\n      threadId\n    }\n    workspaceAppeal {\n      id\n      status\n      createdAt\n      submittedBy {\n        id\n        email\n        name\n      }\n    }\n    viewerAppeal {\n      id\n      type\n      status\n      createdAt\n    }\n  }\n  slackChannelId\n  preferredRegion\n  createdAt\n  currentSessionHasAccess\n  viewerRole\n  projects {\n    edges {\n      node {\n        id\n        name\n        isPublic\n        deletedAt\n      }\n    }\n  }\n}",
+    "variables": {}
+  },
+  "fairUseAgree": {
+    "query": "mutation fairUseAgree($agree: Boolean!) {\n  fairUseAgree(agree: $agree)\n}",
+    "variables": {
+      "agree": true
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# Google accounts pool for the Railway farm
+# One account per line: email|password
+# Also accepted: email:password  or  email<TAB>password
+# Lines starting with # are ignored.
+#
+# Copy this file to google_accounts.txt (gitignored) and fill it in.
+# Every email here is consumed once: after a successful run it is appended to
+# results/used_google.txt and skipped on the next run.
+#
+# Example:
+# user1@gmail.com|MyPassword123
+# user2@domain.com|AnotherPass456

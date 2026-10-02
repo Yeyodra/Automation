@@ -1,0 +1,20 @@
+# Railway farm, dependency notes (NOT installed from here)
+#
+# This farm uses the shared hub virtualenv. Do NOT create farms/railway/.venv.
+# All runtime dependencies are already pinned in the hub:
+#
+#   Automation/requirements.txt
+#     camoufox[geoip]   browser (AsyncCamoufox)
+#     playwright        camoufox driver
+#     python-dotenv     env loading (override=False)
+#     httpx             post-auth GraphQL over the rw.* cookie header
+#     socksio           enables httpx SOCKS5 proxy support (needed for socks5://)
+#
+# Set up once, from the hub root:
+#
+#   .\.venv\Scripts\pip install -r requirements.txt
+#   .\.venv\Scripts\camoufox.exe fetch
+#
+# Run through the hub (it picks the hub venv automatically):
+#
+#   python -m jobs run railway -- -n 5 -c 1 -y
