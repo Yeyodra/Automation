@@ -344,39 +344,95 @@ def _load_proxy_pool_local() -> list[tuple[str, str]]:
 
 
 def _probe_exit_ip(proxy_url: str) -> str:
-    """Exit IP as Cloudflare sees it — IPv6 first, because WARP reuses IPv4
-    anycast exits but hands out distinct IPv6 per registration."""
-    import socks  # PySocks, hub venv
+    """Exit IP as Cloudflare sees it, honouring the proxy's scheme.
 
-    host = urlparse(proxy_url).hostname or "127.0.0.1"
-    port = urlparse(proxy_url).port or 1080
-    s = socks.socksocket()
-    try:
-        s.set_proxy(socks.SOCKS5, host, port)
-        s.settimeout(EXIT_IP_TIMEOUT)
-        s.connect(("auth.converge.ai", 443))
-        ss = ssl.create_default_context().wrap_socket(s, server_hostname="auth.converge.ai")
-        ss.sendall(b"GET /cdn-cgi/trace HTTP/1.1\r\nHost: auth.converge.ai\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n")
-        buf = b""
-        while True:
-            chunk = ss.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-        ss.close()
+    Dispatches on scheme:
+      socks5/socks5h/socks4 -> PySocks
+      http/https            -> raw HTTP CONNECT tunnel (what buff-relay speaks)
+
+    Forcing SOCKS5 on an http:// proxy made every Railway relay report
+    "unreachable" even while it was serving traffic, so the scheme is honoured.
+    """
+    import socket as _socket
+
+    u = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}")
+    scheme = (u.scheme or "http").lower()
+    host = u.hostname or "127.0.0.1"
+    port = u.port or (1080 if scheme.startswith("socks") else 8080)
+    target_host = "auth.converge.ai"
+    target_port = 443
+
+    def _read_trace(sock) -> str:
+        ss = ssl.create_default_context().wrap_socket(sock, server_hostname=target_host)
+        try:
+            ss.sendall(
+                f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {target_host}\r\n"
+                "Connection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n".encode()
+            )
+            buf = b""
+            while True:
+                chunk = ss.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        finally:
+            try:
+                ss.close()
+            except Exception:
+                pass
         body = buf.decode("utf-8", "replace").split("\r\n\r\n", 1)[-1]
         for line in body.splitlines():
             if line.startswith("ip="):
                 return line[3:].strip()
         return ""
+
+    sock = None
+    try:
+        if scheme.startswith("socks"):
+            import socks  # PySocks, hub venv
+
+            s = socks.socksocket()
+            s.set_proxy(
+                socks.SOCKS5, host, port,
+                username=u.username or None, password=u.password or None,
+            )
+            s.settimeout(EXIT_IP_TIMEOUT)
+            s.connect((target_host, target_port))
+            sock = s
+            return _read_trace(sock)
+
+        raw = _socket.create_connection((host, port), timeout=EXIT_IP_TIMEOUT)
+        raw.settimeout(EXIT_IP_TIMEOUT)
+        sock = raw
+        req = [
+            f"CONNECT {target_host}:{target_port} HTTP/1.1",
+            f"Host: {target_host}:{target_port}",
+        ]
+        if u.username:
+            import base64 as _b64
+
+            cred = _b64.b64encode(f"{u.username}:{u.password or ''}".encode()).decode()
+            req.append(f"Proxy-Authorization: Basic {cred}")
+        raw.sendall(("\r\n".join(req) + "\r\n\r\n").encode())
+
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        if " 200" not in status:
+            return ""
+        return _read_trace(raw)
     except Exception:
         return ""
     finally:
         try:
-            s.close()
+            if sock is not None:
+                sock.close()
         except Exception:
             pass
-
 
 def _audit_proxy_pool(pool: list[tuple[str, str]]) -> None:
     """Log exit IP per proxy and flag duplicates.
@@ -505,6 +561,12 @@ def _is_access_denied(msg: str) -> bool:
     later runs skip it.
     """
     low = (msg or "").lower()
+    # Our own abort messages mention access_denied as an *explanation*
+    # ("FPJS unavailable ... random ids => access_denied"), which made a local
+    # pre-auth failure look like Google refusing the account. Those are farm
+    # failures, not a Google verdict, so they must never mark the account dead.
+    if "fpjs unavailable" in low or "landing never became app-ready" in low:
+        return False
     return "access_denied" in low or "access denied" in low
 
 
@@ -661,6 +723,44 @@ async def _click_google_next(page, attempt: int) -> None:
         pass
 
 
+async def _wait_landing_ready(page, attempt: int, max_wait: float = 45.0) -> bool:
+    """Wait until the gift landing is really the app, not a Cloudflare interstitial.
+
+    `goto_with_retry` stops at "commit" (first response), so the Cloudflare
+    "Just a moment..." page is still up when we return. With a datacenter egress
+    (Railway relay) that hold lasts ~10-15s; locally it is instant. Polling the
+    title/URL is the cheap, reliable signal: the app page is titled
+    "Enter Pro: ..." while the interstitial is "Just a moment...".
+
+    Also clicks the managed Turnstile checkbox if one is mounted, and retries
+    the FPJS-dependent readiness once. Returns True if the app page is up.
+    """
+    deadline = time.monotonic() + max(10.0, max_wait)
+    clicked = False
+    while time.monotonic() < deadline:
+        try:
+            title = (await page.title()) or ""
+        except Exception:
+            title = ""
+        low = title.lower()
+        if title and "just a moment" not in low and "attention required" not in low:
+            alog(attempt, f"landing ready (title={title[:40]!r})")
+            return True
+
+        if not clicked:
+            # Managed checkbox may be present; a native click is often enough.
+            try:
+                if await L.try_click_turnstile(page, attempt):
+                    clicked = True
+                    alog(attempt, "landing: clicked Turnstile checkbox")
+            except Exception:
+                pass
+        await asyncio.sleep(1.5)
+
+    alog(attempt, "landing still challenged after wait (continuing to FPJS anyway)")
+    return False
+
+
 async def _goto_login_identifier(page, attempt: int) -> str:
     """gift landing -> FPJS -> risk-session -> /auth/login -> /u/login/identifier.
 
@@ -675,7 +775,18 @@ async def _goto_login_identifier(page, attempt: int) -> str:
     await L.goto_with_retry(
         page, f"{L.APP_HOST}/?{urlencode(q)}", attempt, label="g_landing", warp_on_fail=False
     )
-    await asyncio.sleep(2.5)
+    # Cloudflare ("Just a moment...") holds the landing for ~10-15s when the
+    # egress is a datacenter IP (Railway relay). goto_with_retry only waits for
+    # "commit", so without this the app JS never runs and extract_fpjs fails.
+    # Measured: local IP clears instantly, Railway relay needs ~15s.
+    await _wait_landing_ready(page, attempt)
+
+    v, e = await L.extract_fpjs(page, attempt)
+    if not (v and e):
+        raise RuntimeError(
+            "FPJS unavailable (landing never became app-ready; Cloudflare "
+            "challenge not cleared or app JS blocked)"
+        )
 
     v, e = await L.extract_fpjs(page, attempt)
     if not (v and e):
@@ -761,8 +872,13 @@ async def _click_google_provider(page, attempt: int) -> bool:
     return False
 
 
-async def _handle_google_step(page, attempt: int, url: str) -> str:
-    """One interstitial decision on accounts.google.com. Returns an action tag."""
+async def _handle_google_step(page, attempt: int, url: str, *, consent_done: bool = False) -> str:
+    """One interstitial decision on accounts.google.com. Returns an action tag.
+
+    `consent_done` guards the consent click: the Auth0 state is single-use, so a
+    second click on the same screen destroys the transaction (the app then shows
+    "Oops! something went wrong ... we couldn't find your session").
+    """
     if "speedbump/workspacetermsofservice" in url:
         alog(attempt, "google workspace TOS")
         for _ in range(4):
@@ -777,31 +893,62 @@ async def _handle_google_step(page, attempt: int, url: str) -> str:
 
     if "signin/oauth/consent" in url or "signin/oauth/id" in url:
         alog(attempt, "google oauth consent")
+        if consent_done:
+            # Already clicked once; the redirect is in flight. Do not click again.
+            return "wait"
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             pass
         if await _click_first(page, _CONSENT_SEL, timeout=4000, scroll=True):
             return "consent"
-        # JS fallback across localized labels.
+        # Label-independent fallback. Google localises this screen by the egress
+        # IP's region (a US/Railway relay rendered it in Vietnamese: the accept
+        # button read "Ti\u1ebfp t\u1ee5c", which no label list here matched, so the
+        # farm spun on the consent page until the account timed out). Pick the
+        # affirmative button structurally instead: on this screen the reject /
+        # cancel button always comes first and the accept button is the LAST
+        # enabled button in the footer row.
         try:
-            await page.evaluate(
+            clicked = await page.evaluate(
                 """() => {
-                    const btns = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')];
-                    for (const b of btns) {
-                        const t = (b.innerText || b.value || '').toLowerCase();
-                        if (t.includes('continue') || t.includes('allow') ||
-                            t.includes('lanjutkan') || t.includes('izinkan') ||
-                            t.includes('accept')) {
-                            b.scrollIntoView({block:'center'}); b.click(); return true;
-                        }
-                    }
-                    return false;
+                    const CANCEL = ['cancel','h\u1ee7y','hu\u1ef7','batal','\u043e\u0442\u043c\u0435\u043d\u0430','\u53d6\u6d88','\u0e22\u0e01\u0e40\u0e25\u0e34\u0e01'];
+                    const btns = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')]
+                        .filter(b => {
+                            if (b.offsetParent === null || b.disabled) return false;
+                            // Ignore chrome that is not an action button: the
+                            // language dropdown and the product-name link also
+                            // match this query and sit BELOW the real footer.
+                            const t = ((b.innerText || b.value || '') + '').trim();
+                            return t.length > 0;
+                        });
+                    const isCancel = b => {
+                        const t = ((b.innerText || b.value || '') + '').trim().toLowerCase();
+                        return CANCEL.some(c => t === c || t.startsWith(c));
+                    };
+                    const ok = btns.filter(b => !isCancel(b));
+                    if (!ok.length) return false;
+                    // bottom-most row, right-most button = accept/continue
+                    ok.sort((a, b) => {
+                        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                        if (Math.abs(ra.top - rb.top) > 12) return rb.top - ra.top;
+                        return rb.left - ra.left;
+                    });
+                    const target = ok[0];
+                    target.scrollIntoView({block: 'center'});
+                    target.click();
+                    return true;
                 }"""
             )
+            if clicked:
+                alog(attempt, "google consent: clicked affirmative button (label-independent)")
+                return "consent"
         except Exception:
             pass
-        return "consent"
+        # Nothing clickable: returning "consent" here looped forever, so surface
+        # it and let the caller's deadline end the account.
+        alog(attempt, "google consent: no clickable button found yet")
+        return "wait"
 
     if "challenge" in url or "signin/challenge" in url:
         if any(marker in url for marker in _GOOGLE_2FA_MARKERS):
@@ -834,12 +981,23 @@ async def do_signup_google(page, email_addr: str, password: str, attempt: int) -
     # Drive interstitials until the app callback comes back.
     deadline = time.monotonic() + max(60.0, GOOGLE_STEP_TIMEOUT_S * 3)
     pw_done = False
+    consent_done = False
     while time.monotonic() < deadline:
         u = page.url or ""
-        if "/auth/callback" in u or "code=" in u or _on_enter_host(u):
+        # Only the APP host counts as done. `code=` / `/auth/callback` also
+        # matches the Auth0 intermediate hop (auth.converge.ai/login/callback),
+        # and stopping there made the session fetch hit the wrong origin (404).
+        if _on_enter_host(u):
             break
         if "error=access_denied" in u:
-            raise RuntimeError("access_denied at callback (Google denied the request)")
+            # Include the full URL + page text: Auth0 distinguishes "user denied"
+            # from risk/rule rejections in error_description, and the bare message
+            # hid which one it was.
+            try:
+                body = (await page.inner_text("body"))[:200]
+            except Exception:
+                body = ""
+            raise RuntimeError(f"access_denied at callback :: url={u[:220]} :: body={body!r}")
 
         if _is_google_url(u):
             if "pwd" in u:
@@ -853,21 +1011,57 @@ async def do_signup_google(page, email_addr: str, password: str, attempt: int) -
                 await _click_google_next(page, attempt)
                 await asyncio.sleep(2.5)
                 continue
-            action = await _handle_google_step(page, attempt, u)
+            action = await _handle_google_step(page, attempt, u, consent_done=consent_done)
             if action == "challenge":
                 raise RuntimeError("google 2FA/challenge detected")
+            if action == "consent":
+                # The Auth0 state is single-use. Clicking consent twice burns the
+                # same transaction and the second click lands on
+                # "Oops! something went wrong ... we couldn't find your session".
+                consent_done = True
             await asyncio.sleep(1.5)
             continue
 
         await asyncio.sleep(1.0)
 
-    for i in range(120):
+    # Wait for the app to actually settle before asking for the session.
+    # Landing on the Enter host is not enough: the OAuth code exchange happens
+    # server-side after the redirect, and calling /auth/session in that window
+    # returns 404 (observed: consent clicked -> immediate 404). Poll the session
+    # endpoint until it stops 404/5xx instead of firing once.
+    session_ready = False
+    for i in range(60):
         u = page.url or ""
-        if "/auth/callback" in u or "code=" in u or _on_enter_host(u):
+        if "error=access_denied" in u:
             break
-        if i % 20 == 19:
-            alog(attempt, f"waiting callback url={u.split('?')[0][:70]}")
-        await asyncio.sleep(0.5)
+        try:
+            probe = await page.evaluate(
+                """async () => {
+                    try {
+                        const r = await fetch('/auth/session?include=access_token',
+                                              {credentials: 'include', headers: {'Accept': 'application/json'}});
+                        return r.status;
+                    } catch (e) { return 0; }
+                }"""
+            )
+        except Exception:
+            probe = 0
+        if int(probe or 0) == 200:
+            session_ready = True
+            break
+        if i % 10 == 9:
+            alog(attempt, f"waiting session (status={probe}) url={u.split('?')[0][:60]}")
+        await asyncio.sleep(1.0)
+
+    if not session_ready:
+        # Last resort: make sure we are on the app origin at all.
+        u = page.url or ""
+        if not _on_enter_host(u):
+            try:
+                await L.goto_with_retry(page, f"{L.APP_HOST}/", attempt, label="g_callback_return")
+                await asyncio.sleep(3)
+            except Exception:
+                pass
 
     if "error=access_denied" in (page.url or ""):
         raise RuntimeError("access_denied at callback")
@@ -1162,6 +1356,13 @@ async def do_account(
         if _is_access_denied(msg):
             emit_failed(attempt, "access_denied (Google refused; marking dead, no retry)", email)
             _mark_google_dead(email, msg)
+        elif "not a new user" in msg.lower():
+            # The Google account already completed Enter signup before, so the
+            # gateway returns isNewUser=false. Nothing to farm here, and retrying
+            # would burn a fresh session on the same account forever, so retire it
+            # (used, not dead: the Google account itself is healthy).
+            emit_failed(attempt, "already signed up to Enter (retiring account)", email)
+            _persist_used_google(email)
         else:
             emit_failed(attempt, msg, email)
         try:
